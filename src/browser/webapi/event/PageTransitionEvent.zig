@@ -38,14 +38,14 @@ const PageTransitionEventOptions = struct {
 const Options = Event.inheritOptions(PageTransitionEvent, PageTransitionEventOptions);
 
 pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*PageTransitionEvent {
-    const arena = try page.getArena(.{ .debug = "PageTransitionEvent" });
+    const arena = try page.getArena(.tiny, "PageTransitionEvent");
     errdefer page.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
     return initWithTrusted(arena, type_string, _opts, false, page);
 }
 
 pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*PageTransitionEvent {
-    const arena = try page.getArena(.{ .debug = "PageTransitionEvent.trusted" });
+    const arena = try page.getArena(.tiny, "PageTransitionEvent.trusted");
     errdefer page.releaseArena(arena);
     return initWithTrusted(arena, typ, _opts, true, page);
 }
@@ -66,10 +66,6 @@ fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool
     return event;
 }
 
-pub fn deinit(self: *PageTransitionEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
-}
-
 pub fn asEvent(self: *PageTransitionEvent) *Event {
     return self._proto;
 }
@@ -85,8 +81,6 @@ pub const JsApi = struct {
         pub const name = "PageTransitionEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(PageTransitionEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(PageTransitionEvent.init, .{});

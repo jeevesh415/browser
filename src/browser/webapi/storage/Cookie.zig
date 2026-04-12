@@ -58,7 +58,7 @@ pub fn deinit(self: *const Cookie) void {
 //   - any shenanigans with the domain attribute - it has to be the current
 //     domain or one of higher order, excluding TLD.
 // Anything else, will turn into a cookie.
-// Single value? That's a cookie with an emtpy name and a value
+// Single value? That's a cookie with an empty name and a value
 // Key or Values with characters the RFC says aren't allowed? Allowed! (
 //   (as long as the characters are 32...126)
 // Invalid attributes? Ignored.
@@ -273,6 +273,12 @@ pub fn parseDomain(arena: Allocator, url_: ?[:0]const u8, explicit_domain: ?[]co
                 // can't set a cookie for a TLD
                 return error.InvalidDomain;
             }
+
+            // Can't set a cookie for a public suffix (e.g. co.uk, com.au).
+            if (public_suffix_list(owned_domain[1..])) {
+                return error.InvalidDomain;
+            }
+
             if (encoded_host) |host| {
                 if (std.mem.endsWith(u8, host, owned_domain[1..]) == false) {
                     return error.InvalidDomain;
@@ -283,7 +289,10 @@ pub fn parseDomain(arena: Allocator, url_: ?[:0]const u8, explicit_domain: ?[]co
         }
     }
 
-    return encoded_host orelse return error.InvalidDomain; // default-domain
+    if (encoded_host) |host| {
+        if (host.len > 0) return host;
+    }
+    return error.InvalidDomain;
 }
 
 pub fn percentEncode(arena: Allocator, part: []const u8, comptime isValidChar: fn (u8) bool) ![]u8 {
@@ -353,6 +362,9 @@ pub fn appliesTo(self: *const Cookie, url: *const PreparedUri, same_site: bool, 
     }
 
     {
+        if (self.domain.len == 0) {
+            return false;
+        }
         if (self.domain[0] == '.') {
             // When a Set-Cookie header has a Domain attribute
             // Then we will _always_ prefix it with a dot, extending its
@@ -372,7 +384,7 @@ pub fn appliesTo(self: *const Cookie, url: *const PreparedUri, same_site: bool, 
     {
         if (self.path[self.path.len - 1] == '/') {
             // If our cookie has a trailing slash, we can only match is
-            // the target path is a perfix. I.e., if our path is
+            // the target path is a prefix. I.e., if our path is
             // /doc/  we can only match /doc/*
             if (std.mem.startsWith(u8, url.path, self.path) == false) {
                 return false;
@@ -1027,6 +1039,15 @@ test "Cookie: parse domain" {
     try expectError(error.InvalidDomain, "http://lightpanda.io/", "b;domain=other.lightpanda.io");
     try expectError(error.InvalidDomain, "http://lightpanda.io/", "b;domain=other.lightpanda.com");
     try expectError(error.InvalidDomain, "http://lightpanda.io/", "b;domain=other.example.com");
+
+    // Public suffixes should be rejected (test PSL entries: "gov.uk", "api.gov.uk")
+    try expectError(error.InvalidDomain, "http://example.gov.uk/", "b;domain=gov.uk");
+    try expectError(error.InvalidDomain, "http://example.gov.uk/", "b;domain=.gov.uk");
+    try expectError(error.InvalidDomain, "http://test.api.gov.uk/", "b;domain=api.gov.uk");
+
+    // Subdomains of public suffixes should still be accepted
+    try expectAttribute(.{ .domain = ".example.gov.uk" }, "http://example.gov.uk/", "b;domain=example.gov.uk");
+    try expectAttribute(.{ .domain = ".example.gov.uk" }, "http://sub.example.gov.uk/", "b;domain=example.gov.uk");
 }
 
 test "Cookie: parse limit" {
@@ -1078,4 +1099,29 @@ fn expectAttribute(expected: anytype, url_: ?[:0]const u8, set_cookie: []const u
 
 fn expectError(expected: anyerror, url: ?[:0]const u8, set_cookie: []const u8) !void {
     try testing.expectError(expected, Cookie.parse(testing.allocator, url orelse test_url, set_cookie));
+}
+
+test "Cookie: appliesTo with empty domain" {
+    const cookie = Cookie{
+        .arena = std.heap.ArenaAllocator.init(testing.allocator),
+        .name = "test",
+        .value = "value",
+        .domain = "",
+        .path = "/",
+        .expires = null,
+    };
+    defer cookie.deinit();
+
+    const target = PreparedUri{
+        .host = "example.com",
+        .path = "/",
+        .secure = false,
+    };
+
+    try testing.expectEqual(false, cookie.appliesTo(&target, true, true, true));
+}
+
+test "Cookie: parse rejects URL with empty host" {
+    try testing.expectError(error.InvalidDomain, Cookie.parse(testing.allocator, "http:///path", "name=value"));
+    try testing.expectError(error.InvalidDomain, Cookie.parse(testing.allocator, "http://", "name=value"));
 }

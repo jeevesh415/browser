@@ -27,7 +27,6 @@ const IS_DEBUG = builtin.mode == .Debug;
 
 const log = @import("../log.zig");
 
-const App = @import("../App.zig");
 const String = @import("../string.zig").String;
 
 const Mime = @import("Mime.zig");
@@ -35,14 +34,15 @@ const Factory = @import("Factory.zig");
 const Session = @import("Session.zig");
 const EventManager = @import("EventManager.zig");
 const ScriptManager = @import("ScriptManager.zig");
+const StyleManager = @import("StyleManager.zig");
 
 const Parser = @import("parser/Parser.zig");
+const h5e = @import("parser/html5ever.zig");
 
 const URL = @import("URL.zig");
 const Blob = @import("webapi/Blob.zig");
 const Node = @import("webapi/Node.zig");
 const Event = @import("webapi/Event.zig");
-const EventTarget = @import("webapi/EventTarget.zig");
 const CData = @import("webapi/CData.zig");
 const Element = @import("webapi/Element.zig");
 const HtmlElement = @import("webapi/element/Html.zig");
@@ -58,14 +58,13 @@ const AbstractRange = @import("webapi/AbstractRange.zig");
 const MutationObserver = @import("webapi/MutationObserver.zig");
 const IntersectionObserver = @import("webapi/IntersectionObserver.zig");
 const CustomElementDefinition = @import("webapi/CustomElementDefinition.zig");
-const storage = @import("webapi/storage/storage.zig");
 const PageTransitionEvent = @import("webapi/event/PageTransitionEvent.zig");
+const SubmitEvent = @import("webapi/event/SubmitEvent.zig");
 const NavigationKind = @import("webapi/navigation/root.zig").NavigationKind;
 const KeyboardEvent = @import("webapi/event/KeyboardEvent.zig");
 const MouseEvent = @import("webapi/event/MouseEvent.zig");
 
 const HttpClient = @import("HttpClient.zig");
-const ArenaPool = App.ArenaPool;
 
 const timestamp = @import("../datetime.zig").timestamp;
 const milliTimestamp = @import("../datetime.zig").milliTimestamp;
@@ -98,7 +97,7 @@ _parse_mode: enum { document, fragment, document_write } = .document,
 // identity (a given attribute should return the same *Attribute), so we do
 // a look here. We don't store this in the Element or Attribute.List.Entry
 // because that would require additional space per element / Attribute.List.Entry
-// even thoug we'll create very few (if any) actual *Attributes.
+// even though we'll create very few (if any) actual *Attributes.
 _attribute_lookup: std.AutoHashMapUnmanaged(usize, *Element.Attribute) = .empty,
 
 // Same as _atlribute_lookup, but instead of individual attributes, this is for
@@ -144,6 +143,7 @@ _blob_urls: std.StringHashMapUnmanaged(*Blob) = .{},
 /// A call to `documentIsComplete` (which calls `_documentIsComplete`) resets it.
 _to_load: std.ArrayList(*Element.Html) = .{},
 
+_style_manager: StyleManager,
 _script_manager: ScriptManager,
 
 // List of active live ranges (for mutation updates per DOM spec)
@@ -207,6 +207,9 @@ base_url: ?[:0]const u8 = null,
 // referer header cache.
 referer_header: ?[:0]const u8 = null,
 
+// Document charset (canonical name from encoding_rs, static lifetime)
+charset: []const u8 = "UTF-8",
+
 // Arbitrary buffer. Need to temporarily lowercase a value? Use this. No lifetime
 // guarantee - it's valid until someone else uses it.
 buf: [BUF_SIZE]u8 = undefined,
@@ -248,7 +251,7 @@ pub fn init(self: *Page, frame_id: u32, session: *Session, parent: ?*Page) !void
         log.debug(.page, "page.init", .{});
     }
 
-    const call_arena = try session.getArena(.{ .debug = "call_arena" });
+    const call_arena = try session.getArena(.medium, "call_arena");
     errdefer session.releaseArena(call_arena);
 
     const factory = &session.factory;
@@ -269,6 +272,7 @@ pub fn init(self: *Page, frame_id: u32, session: *Session, parent: ?*Page) !void
         ._factory = factory,
         ._pending_loads = 1, // always 1 for the ScriptManager
         ._type = if (parent == null) .root else .frame,
+        ._style_manager = undefined,
         ._script_manager = undefined,
         ._event_manager = EventManager.init(session.page_arena, self),
     };
@@ -296,13 +300,22 @@ pub fn init(self: *Page, frame_id: u32, session: *Session, parent: ?*Page) !void
         ._performance = Performance.init(),
         ._screen = screen,
         ._visual_viewport = visual_viewport,
+        ._cross_origin_wrapper = undefined,
     });
+    self.window._cross_origin_wrapper = .{ .window = self.window };
+
+    self._style_manager = try StyleManager.init(self);
+    errdefer self._style_manager.deinit();
 
     const browser = session.browser;
     self._script_manager = ScriptManager.init(browser.allocator, browser.http_client, self);
     errdefer self._script_manager.deinit();
 
-    self.js = try browser.env.createContext(self);
+    self.js = try browser.env.createContext(self, .{
+        .identity = &session.identity,
+        .identity_arena = session.page_arena,
+        .call_arena = self.call_arena,
+    });
     errdefer self.js.deinit();
 
     document._page = self;
@@ -342,6 +355,30 @@ pub fn deinit(self: *Page, abort_http: bool) void {
         session.releaseArena(qn.arena);
     }
 
+    {
+        // Release all objects we're referencing
+        {
+            var it = self._blob_urls.valueIterator();
+            while (it.next()) |blob| {
+                blob.*.releaseRef(session);
+            }
+        }
+
+        {
+            var it: ?*std.DoublyLinkedList.Node = self._mutation_observers.first;
+            while (it) |node| : (it = node.next) {
+                const observer: *MutationObserver = @fieldParentPtr("node", node);
+                observer.releaseRef(session);
+            }
+        }
+
+        for (self._intersection_observers.items) |observer| {
+            observer.releaseRef(session);
+        }
+
+        self.window._document._selection.releaseRef(session);
+    }
+
     session.browser.env.destroyContext(self.js);
 
     self._script_manager.shutdown = true;
@@ -356,6 +393,7 @@ pub fn deinit(self: *Page, abort_http: bool) void {
     }
 
     self._script_manager.deinit();
+    self._style_manager.deinit();
 
     session.releaseArena(self.call_arena);
 }
@@ -371,12 +409,9 @@ pub fn getTitle(self: *Page) !?[]const u8 {
     return null;
 }
 
-// Add comon headers for a request:
-// * cookies
+// Add common headers for a request:
 // * referer
-pub fn headersForRequest(self: *Page, temp: Allocator, url: [:0]const u8, headers: *HttpClient.Headers) !void {
-    try self.requestCookie(.{}).headersForRequest(temp, url, headers);
-
+pub fn headersForRequest(self: *Page, headers: *HttpClient.Headers) !void {
     // Build the referer
     const referer = blk: {
         if (self.referer_header == null) {
@@ -397,8 +432,8 @@ pub fn headersForRequest(self: *Page, temp: Allocator, url: [:0]const u8, header
     }
 }
 
-pub fn getArena(self: *Page, comptime opts: Session.GetArenaOpts) !Allocator {
-    return self._session.getArena(opts);
+pub fn getArena(self: *Page, size_or_bucket: anytype, debug: []const u8) !Allocator {
+    return self._session.getArena(size_or_bucket, debug);
 }
 
 pub fn releaseArena(self: *Page, allocator: Allocator) void {
@@ -407,7 +442,15 @@ pub fn releaseArena(self: *Page, allocator: Allocator) void {
 
 pub fn isSameOrigin(self: *const Page, url: [:0]const u8) !bool {
     const current_origin = self.origin orelse return false;
-    return std.mem.startsWith(u8, url, current_origin);
+
+    // fastpath
+    if (!std.mem.startsWith(u8, url, current_origin)) {
+        return false;
+    }
+
+    // Starting here, at least protocols are equals.
+    // Compare hosts (domain:port) strictly
+    return std.mem.eql(u8, URL.getHost(url), URL.getHost(current_origin));
 }
 
 /// Look up a blob URL in this page's registry.
@@ -437,6 +480,12 @@ pub fn navigate(self: *Page, request_url: [:0]const u8, opts: NavigateOpts) !voi
     if (is_about_blank or is_blob) {
         self.url = if (is_about_blank) "about:blank" else try self.arena.dupeZ(u8, request_url);
 
+        // even though this might be the same _data_ as `default_location`, we
+        // have to do this to make sure window.location is at a unique _address_.
+        // If we don't do this, multiple window._location will have the same
+        // address and thus be mapped to the same v8::Object in the identity map.
+        self.window._location = try Location.init(self.url, self);
+
         if (is_blob) {
             // strip out blob:
             self.origin = try URL.getOrigin(self.arena, request_url[5.. :0]);
@@ -464,7 +513,7 @@ pub fn navigate(self: *Page, request_url: [:0]const u8, opts: NavigateOpts) !voi
                 log.warn(.js, "invalid blob", .{ .url = request_url });
                 return error.BlobNotFound;
             };
-            const parse_arena = try self.getArena(.{ .debug = "Page.parseBlob" });
+            const parse_arena = try self.getArena(.medium, "Page.parseBlob");
             defer self.releaseArena(parse_arena);
             var parser = Parser.init(parse_arena, self.document.asNode(), self);
             parser.parse(blob._slice);
@@ -474,7 +523,6 @@ pub fn navigate(self: *Page, request_url: [:0]const u8, opts: NavigateOpts) !voi
                 return error.InjectBlankFailed;
             };
         }
-        self.documentIsComplete();
 
         session.notification.dispatch(.page_navigate, &.{
             .frame_id = self._frame_id,
@@ -506,6 +554,8 @@ pub fn navigate(self: *Page, request_url: [:0]const u8, opts: NavigateOpts) !voi
 
         // force next request id manually b/c we won't create a real req.
         _ = session.browser.http_client.incrReqId();
+
+        self.documentIsComplete();
         return;
     }
 
@@ -525,8 +575,6 @@ pub fn navigate(self: *Page, request_url: [:0]const u8, opts: NavigateOpts) !voi
     if (opts.header) |hdr| {
         try headers.add(hdr);
     }
-    try self.requestCookie(.{ .is_navigation = true }).headersForRequest(self.arena, self.url, &headers);
-
     // We dispatch page_navigate event before sending the request.
     // It ensures the event page_navigated is not dispatched before this one.
     session.notification.dispatch(.page_navigate, &.{
@@ -553,6 +601,7 @@ pub fn navigate(self: *Page, request_url: [:0]const u8, opts: NavigateOpts) !voi
         .headers = headers,
         .body = opts.body,
         .cookie_jar = &session.cookie_jar,
+        .cookie_origin = self.url,
         .resource_type = .document,
         .notification = self._session.notification,
         .header_callback = pageHeaderDoneCallback,
@@ -573,7 +622,7 @@ pub fn scheduleNavigation(self: *Page, request_url: []const u8, opts: NavigateOp
     if (self.canScheduleNavigation(std.meta.activeTag(nt)) == false) {
         return;
     }
-    const arena = try self._session.getArena(.{ .debug = "scheduleNavigation" });
+    const arena = try self._session.getArena(.small, "scheduleNavigation");
     errdefer self._session.releaseArena(arena);
     return self.scheduleNavigationWithArena(arena, request_url, opts, nt);
 }
@@ -583,15 +632,36 @@ pub fn scheduleNavigation(self: *Page, request_url: []const u8, opts: NavigateOp
 // page that it's acting on.
 fn scheduleNavigationWithArena(originator: *Page, arena: Allocator, request_url: []const u8, opts: NavigateOpts, nt: Navigation) !void {
     const resolved_url, const is_about_blank = blk: {
+        if (URL.isCompleteHTTPUrl(request_url)) {
+            break :blk .{ try arena.dupeZ(u8, request_url), false };
+        }
+
         if (std.mem.eql(u8, request_url, "about:blank")) {
             // navigate will handle this special case
             break :blk .{ "about:blank", true };
         }
+
+        // request_url isn't a "complete" URL, so it has to be resolved with the
+        // originator's base. Unless, originator's base is "about:blank", in which
+        // case we have to walk up the parents and find a real base.
+        const page_base = base_blk: {
+            var maybe_not_blank_page = originator;
+            while (true) {
+                const maybe_base = maybe_not_blank_page.base();
+                if (std.mem.eql(u8, maybe_base, "about:blank") == false) {
+                    break :base_blk maybe_base;
+                }
+                // The orelse here is probably an invalid case, but there isn't
+                // anything we can do about it. It should never happen?
+                maybe_not_blank_page = maybe_not_blank_page.parent orelse break :base_blk "";
+            }
+        };
+
         const u = try URL.resolve(
             arena,
-            originator.base(),
+            page_base,
             request_url,
-            .{ .always_dupe = true, .encode = true },
+            .{ .always_dupe = true, .encoding = originator.charset },
         );
         break :blk .{ u, false };
     };
@@ -622,7 +692,7 @@ fn scheduleNavigationWithArena(originator: *Page, arena: Allocator, request_url:
     });
 
     // This is a micro-optimization. Terminate any inflight request as early
-    // as we can. This will be more propery shutdown when we process the
+    // as we can. This will be more properly shutdown when we process the
     // scheduled navigation.
     if (target.parent == null) {
         session.browser.http_client.abort();
@@ -705,6 +775,12 @@ pub fn _documentIsLoaded(self: *Page) !void {
         self.document.asEventTarget(),
         event,
     );
+
+    self._session.notification.dispatch(.page_dom_content_loaded, &.{
+        .frame_id = self._frame_id,
+        .req_id = self._req_id,
+        .timestamp = timestamp(.monotonic),
+    });
 }
 
 pub fn scriptsCompletedLoading(self: *Page) void {
@@ -763,19 +839,6 @@ pub fn documentIsComplete(self: *Page) void {
     self._documentIsComplete() catch |err| {
         log.err(.page, "document is complete", .{ .err = err, .type = self._type, .url = self.url });
     };
-
-    if (self._navigated_options) |no| {
-        // _navigated_options will be null in special short-circuit cases, like
-        // "navigating" to about:blank, in which case this notification has
-        // already been sent
-        self._session.notification.dispatch(.page_navigated, &.{
-            .frame_id = self._frame_id,
-            .req_id = self._req_id,
-            .opts = no,
-            .url = self.url,
-            .timestamp = timestamp(.monotonic),
-        });
-    }
 }
 
 fn _documentIsComplete(self: *Page) !void {
@@ -793,6 +856,12 @@ fn _documentIsComplete(self: *Page) !void {
         event._target = self.document.asEventTarget();
         try self._event_manager.dispatchDirect(window_target, event, self.window._on_load, .{ .inject_target = false, .context = "page load" });
     }
+
+    self._session.notification.dispatch(.page_loaded, &.{
+        .frame_id = self._frame_id,
+        .req_id = self._req_id,
+        .timestamp = timestamp(.monotonic),
+    });
 
     if (self._event_manager.hasDirectListeners(window_target, "pageshow", self.window._on_pageshow)) {
         const pageshow_event = (try PageTransitionEvent.initTrusted(comptime .wrap("pageshow"), .{}, self)).asEvent();
@@ -821,12 +890,10 @@ fn notifyParentLoadComplete(self: *Page) void {
     parent.iframeCompletedLoading(self.iframe.?);
 }
 
-fn pageHeaderDoneCallback(transfer: *HttpClient.Transfer) !bool {
-    var self: *Page = @ptrCast(@alignCast(transfer.ctx));
+fn pageHeaderDoneCallback(response: HttpClient.Response) !bool {
+    var self: *Page = @ptrCast(@alignCast(response.ctx));
 
-    const header = &transfer.response_header.?;
-
-    const response_url = std.mem.span(header.url);
+    const response_url = response.url();
     if (std.mem.eql(u8, response_url, self.url) == false) {
         // would be different than self.url in the case of a redirect
         self.url = try self.arena.dupeZ(u8, response_url);
@@ -840,23 +907,36 @@ fn pageHeaderDoneCallback(transfer: *HttpClient.Transfer) !bool {
     if (comptime IS_DEBUG) {
         log.debug(.page, "navigate header", .{
             .url = self.url,
-            .status = header.status,
-            .content_type = header.contentType(),
+            .status = response.status(),
+            .content_type = response.contentType(),
             .type = self._type,
+        });
+    }
+
+    if (self._navigated_options) |no| {
+        // _navigated_options will be null in special short-circuit cases, like
+        // "navigating" to about:blank, in which case this notification has
+        // already been sent
+        self._session.notification.dispatch(.page_navigated, &.{
+            .frame_id = self._frame_id,
+            .req_id = self._req_id,
+            .opts = no,
+            .url = self.url,
+            .timestamp = timestamp(.monotonic),
         });
     }
 
     return true;
 }
 
-fn pageDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
-    var self: *Page = @ptrCast(@alignCast(transfer.ctx));
+fn pageDataCallback(response: HttpClient.Response, data: []const u8) !void {
+    var self: *Page = @ptrCast(@alignCast(response.ctx));
 
     if (self._parse_state == .pre) {
         // we lazily do this, because we might need the first chunk of data
         // to sniff the content type
         var mime: Mime = blk: {
-            if (transfer.response_header.?.contentType()) |ct| {
+            if (response.contentType()) |ct| {
                 break :blk try Mime.parse(ct);
             }
             break :blk Mime.sniff(data);
@@ -884,7 +964,15 @@ fn pageDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
         }
 
         switch (mime.content_type) {
-            .text_html => self._parse_state = .{ .html = .{} },
+            .text_html => {
+                // Normalize and store the charset using encoding_rs canonical names
+                const charset_str = mime.charsetString();
+                const info = h5e.encoding_for_label(charset_str.ptr, charset_str.len);
+                if (info.isValid()) {
+                    self.charset = info.name();
+                }
+                self._parse_state = .{ .html = .empty };
+            },
             .application_json, .text_javascript, .text_css, .text_plain => {
                 var arr: std.ArrayList(u8) = .empty;
                 try arr.appendSlice(self.arena, "<html><head><meta charset=\"utf-8\"></head><body><pre>");
@@ -898,7 +986,7 @@ fn pageDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
     }
 
     switch (self._parse_state) {
-        .html => |*buf| try buf.appendSlice(self.arena, data),
+        .html => |*html| try html.appendSlice(self.arena, data),
         .text => |*buf| {
             // we have to escape the data...
             var v = data;
@@ -941,14 +1029,20 @@ fn pageDoneCallback(ctx: *anyopaque) !void {
         });
     };
 
-    const parse_arena = try self.getArena(.{ .debug = "Page.parse" });
+    const parse_arena = try self.getArena(.medium, "Page.parse");
     defer self.releaseArena(parse_arena);
 
     var parser = Parser.init(parse_arena, self.document.asNode(), self);
 
     switch (self._parse_state) {
-        .html => |buf| {
-            parser.parse(buf.items);
+        .html => |*html_buf| {
+            const raw_html = html_buf.items;
+
+            if (std.mem.eql(u8, self.charset, "UTF-8")) {
+                parser.parse(raw_html);
+            } else {
+                parser.parseWithEncoding(raw_html, self.charset);
+            }
             self._script_manager.staticScriptsDone();
             self._parse_state = .complete;
         },
@@ -995,6 +1089,7 @@ fn pageDoneCallback(ctx: *anyopaque) !void {
             });
 
             parser.parse(html);
+            self._parse_state = .complete;
             self.documentIsComplete();
         },
         else => unreachable,
@@ -1014,7 +1109,6 @@ fn pageErrorCallback(ctx: *anyopaque, err: anyerror) void {
         return;
     };
 }
-
 pub fn isGoingAway(self: *const Page) bool {
     if (self._queued_navigation != null) {
         return true;
@@ -1087,7 +1181,7 @@ pub fn iframeAddedCallback(self: *Page, iframe: *IFrame) !void {
     iframe._window = page_frame.window;
     errdefer iframe._window = null;
 
-    // on first load, dispatch frame_created evnet
+    // on first load, dispatch frame_created event
     self._session.notification.dispatch(.page_frame_created, &.{
         .frame_id = frame_id,
         .parent_id = self._frame_id,
@@ -1102,7 +1196,7 @@ pub fn iframeAddedCallback(self: *Page, iframe: *IFrame) !void {
             self.call_arena, // ok to use, page.navigate dupes this
             self.base(),
             src,
-            .{ .encode = true },
+            .{ .encoding = self.charset },
         );
     };
 
@@ -1291,20 +1385,24 @@ pub fn schedulePerformanceObserverDelivery(self: *Page) !void {
 }
 
 pub fn registerMutationObserver(self: *Page, observer: *MutationObserver) !void {
+    observer.acquireRef();
     self._mutation_observers.append(&observer.node);
 }
 
 pub fn unregisterMutationObserver(self: *Page, observer: *MutationObserver) void {
+    observer.releaseRef(self._session);
     self._mutation_observers.remove(&observer.node);
 }
 
 pub fn registerIntersectionObserver(self: *Page, observer: *IntersectionObserver) !void {
+    observer.acquireRef();
     try self._intersection_observers.append(self.arena, observer);
 }
 
 pub fn unregisterIntersectionObserver(self: *Page, observer: *IntersectionObserver) void {
     for (self._intersection_observers.items, 0..) |obs, i| {
         if (obs == observer) {
+            observer.releaseRef(self._session);
             _ = self._intersection_observers.swapRemove(i);
             return;
         }
@@ -2557,6 +2655,17 @@ pub fn removeNode(self: *Page, parent: *Node, child: *Node, opts: RemoveNodeOpts
         }
 
         Element.Html.Custom.invokeDisconnectedCallbackOnElement(el, self);
+
+        // If a <style> element is being removed, remove its sheet from the list
+        if (el.is(Element.Html.Style)) |style| {
+            if (style._sheet) |sheet| {
+                if (self.document._style_sheets) |sheets| {
+                    sheets.remove(sheet);
+                }
+                style._sheet = null;
+            }
+            self._style_manager.sheetModified();
+        }
     }
 }
 
@@ -2568,8 +2677,10 @@ pub fn appendAllChildren(self: *Page, parent: *Node, target: *Node) !void {
     self.domChanged();
     const dest_connected = target.isConnected();
 
-    var it = parent.childrenIterator();
-    while (it.next()) |child| {
+    // Use firstChild() instead of iterator to handle cases where callbacks
+    // (like custom element connectedCallback) modify the parent during iteration.
+    // The iterator captures "next" pointers that can become stale.
+    while (parent.firstChild()) |child| {
         // Check if child was connected BEFORE removing it from parent
         const child_was_connected = child.isConnected();
         self.removeNode(parent, child, .{ .will_be_reconnected = dest_connected });
@@ -2581,8 +2692,10 @@ pub fn insertAllChildrenBefore(self: *Page, fragment: *Node, parent: *Node, ref_
     self.domChanged();
     const dest_connected = parent.isConnected();
 
-    var it = fragment.childrenIterator();
-    while (it.next()) |child| {
+    // Use firstChild() instead of iterator to handle cases where callbacks
+    // (like custom element connectedCallback) modify the fragment during iteration.
+    // The iterator captures "next" pointers that can become stale.
+    while (fragment.firstChild()) |child| {
         // Check if child was connected BEFORE removing it from fragment
         const child_was_connected = child.isConnected();
         self.removeNode(fragment, child, .{ .will_be_reconnected = dest_connected });
@@ -3087,7 +3200,7 @@ const IdleNotification = union(enum) {
     init,
 
     // timestamp where the state was first triggered. If the state stays
-    // true (e.g. 0 nework activity for NetworkIdle, or <= 2 for NetworkAlmostIdle)
+    // true (e.g. 0 network activity for NetworkIdle, or <= 2 for NetworkAlmostIdle)
     // for 500ms, it'll send the notification and transition to .done. If
     // the state doesn't stay true, it'll revert to .init.
     triggered: u64,
@@ -3343,7 +3456,7 @@ pub fn handleClick(self: *Page, target: *Node) !void {
 pub fn triggerKeyboard(self: *Page, keyboard_event: *KeyboardEvent) !void {
     const event = keyboard_event.asEvent();
     const element = self.window._document._active_element orelse {
-        keyboard_event.deinit(false, self._session);
+        event.deinit(self._session);
         return;
     };
 
@@ -3434,11 +3547,12 @@ pub fn submitForm(self: *Page, submitter_: ?*Element, form_: ?*Element.Html.Form
     };
 
     if (submit_opts.fire_event) {
-        const submit_event = try Event.initTrusted(comptime .wrap("submit"), .{ .bubbles = true, .cancelable = true }, self);
+        const submitter_html: ?*HtmlElement = if (submitter_) |s| s.is(HtmlElement) else null;
+        const submit_event = (try SubmitEvent.initTrusted(comptime .wrap("submit"), .{ .bubbles = true, .cancelable = true, .submitter = submitter_html }, self)).asEvent();
 
         // so submit_event is still valid when we check _prevent_default
         submit_event.acquireRef();
-        defer submit_event.deinit(false, self._session);
+        defer _ = submit_event.releaseRef(self._session);
 
         try self._event_manager.dispatch(form_element.asEventTarget(), submit_event);
         // If the submit event was prevented, don't submit the form
@@ -3452,7 +3566,7 @@ pub fn submitForm(self: *Page, submitter_: ?*Element, form_: ?*Element.Html.Form
     // I don't think this is technically correct, but FormData handles it ok
     const form_data = try FormData.init(form, submitter_, self);
 
-    const arena = try self._session.getArena(.{ .debug = "submitForm" });
+    const arena = try self._session.getArena(.medium, "submitForm");
     errdefer self._session.releaseArena(arena);
 
     const encoding = form_element.getAttributeSafe(comptime .wrap("enctype"));
@@ -3497,19 +3611,6 @@ pub fn insertText(self: *Page, v: []const u8) !void {
     }
 }
 
-const RequestCookieOpts = struct {
-    is_http: bool = true,
-    is_navigation: bool = false,
-};
-pub fn requestCookie(self: *const Page, opts: RequestCookieOpts) HttpClient.RequestCookie {
-    return .{
-        .jar = &self._session.cookie_jar,
-        .origin = self.url,
-        .is_http = opts.is_http,
-        .is_navigation = opts.is_navigation,
-    };
-}
-
 fn asUint(comptime string: anytype) std.meta.Int(
     .unsigned,
     @bitSizeOf(@TypeOf(string.*)) - 8, // (- 8) to exclude sentinel 0
@@ -3525,19 +3626,51 @@ fn asUint(comptime string: anytype) std.meta.Int(
 
 const testing = @import("../testing.zig");
 test "WebApi: Page" {
-    const filter: testing.LogFilter = .init(&.{ .http, .js });
-    defer filter.deinit();
-
     try testing.htmlRunner("page", .{});
 }
 
 test "WebApi: Frames" {
-    const filter: testing.LogFilter = .init(&.{.js});
-    defer filter.deinit();
-
     try testing.htmlRunner("frames", .{});
 }
 
 test "WebApi: Integration" {
     try testing.htmlRunner("integration", .{});
+}
+
+test "Page: isSameOrigin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var page: Page = undefined;
+
+    page.origin = null;
+    try testing.expectEqual(false, page.isSameOrigin("https://origin.com/"));
+
+    page.origin = try URL.getOrigin(allocator, "https://origin.com/foo/bar") orelse unreachable;
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com/foo/bar")); // exact same
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com/bar/bar")); // path differ
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com/")); // path differ
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com")); // no path
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com/foo?q=1"));
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com/foo#hash"));
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com/foo?q=1#hash"));
+    // FIXME try testing.expectEqual(true, page.isSameOrigin("https://foo:bar@origin.com"));
+    // FIXME try testing.expectEqual(true, page.isSameOrigin("https://origin.com:443/foo"));
+
+    try testing.expectEqual(false, page.isSameOrigin("http://origin.com/")); // another proto
+    try testing.expectEqual(false, page.isSameOrigin("https://origin.com:123/")); // another port
+    try testing.expectEqual(false, page.isSameOrigin("https://sub.origin.com/")); // another subdomain
+    try testing.expectEqual(false, page.isSameOrigin("https://target.com/")); // different domain
+    try testing.expectEqual(false, page.isSameOrigin("https://origin.com.target.com/")); // different domain
+    try testing.expectEqual(false, page.isSameOrigin("https://target.com/@origin.com"));
+
+    page.origin = try URL.getOrigin(allocator, "https://origin.com:8443/foo") orelse unreachable;
+    try testing.expectEqual(true, page.isSameOrigin("https://origin.com:8443/bar"));
+    try testing.expectEqual(false, page.isSameOrigin("https://origin.com/bar")); // missing port
+    try testing.expectEqual(false, page.isSameOrigin("https://origin.com:9999/bar")); // wrong port
+
+    try testing.expectEqual(false, page.isSameOrigin(""));
+    try testing.expectEqual(false, page.isSameOrigin("not-a-url"));
+    try testing.expectEqual(false, page.isSameOrigin("//origin.com/foo"));
 }

@@ -37,6 +37,14 @@ pub const resolve = @import("../URL.zig").resolve;
 pub const eqlDocument = @import("../URL.zig").eqlDocument;
 
 pub fn init(url: [:0]const u8, base_: ?[:0]const u8, page: *Page) !*URL {
+    const arena = page.arena;
+
+    if (std.mem.eql(u8, url, "about:blank")) {
+        return page._factory.create(URL{
+            ._raw = "about:blank",
+            ._arena = arena,
+        });
+    }
     const url_is_absolute = @import("../URL.zig").isCompleteHTTPUrl(url);
 
     const base = if (base_) |b| blk: {
@@ -53,7 +61,6 @@ pub fn init(url: [:0]const u8, base_: ?[:0]const u8, page: *Page) !*URL {
         return error.TypeError;
     } else page.url;
 
-    const arena = page.arena;
     const raw = try resolve(arena, base, url, .{ .always_dupe = true });
 
     return page._factory.create(URL{
@@ -249,8 +256,7 @@ pub fn createObjectURL(blob: *Blob, page: *Page) ![]const u8 {
         .{ page.origin orelse "null", uuid_buf },
     );
     try page._blob_urls.put(page.arena, blob_url, blob);
-    // prevent GC from cleaning up the blob while it's in the registry
-    page.js.strongRef(blob);
+    blob.acquireRef();
     return blob_url;
 }
 
@@ -260,9 +266,8 @@ pub fn revokeObjectURL(url: []const u8, page: *Page) void {
         return;
     }
 
-    // Remove from registry and release strong ref (no-op if not found)
     if (page._blob_urls.fetchRemove(url)) |entry| {
-        page.js.weakRef(entry.value);
+        entry.value.releaseRef(page._session);
     }
 }
 

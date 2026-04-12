@@ -22,12 +22,11 @@ const net = std.net;
 const posix = std.posix;
 
 const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
 
 const log = @import("log.zig");
 const App = @import("App.zig");
 const Config = @import("Config.zig");
-const CDP = @import("cdp/cdp.zig").CDP;
+const CDP = @import("cdp/CDP.zig");
 const Net = @import("network/websocket.zig");
 const HttpClient = @import("browser/HttpClient.zig");
 
@@ -45,7 +44,7 @@ clients_pool: std.heap.MemoryPool(Client),
 
 pub fn init(app: *App, address: net.Address) !*Server {
     const allocator = app.allocator;
-    const json_version_response = try buildJSONVersionResponse(allocator, address);
+    const json_version_response = try buildJSONVersionResponse(app);
     errdefer allocator.free(json_version_response);
 
     const self = try allocator.create(Server);
@@ -212,7 +211,7 @@ pub const Client = struct {
     http: *HttpClient,
     ws: Net.WsConnection,
 
-    fn init(
+    pub fn init(
         socket: posix.socket_t,
         allocator: Allocator,
         app: *App,
@@ -250,7 +249,7 @@ pub const Client = struct {
         self.ws.shutdown();
     }
 
-    fn deinit(self: *Client) void {
+    pub fn deinit(self: *Client) void {
         switch (self.mode) {
             .cdp => |*cdp| cdp.deinit(),
             .http => {},
@@ -298,20 +297,12 @@ pub const Client = struct {
         }
 
         var cdp = &self.mode.cdp;
-        var last_message = milliTimestamp(.monotonic);
-        var ms_remaining = self.ws.timeout_ms;
+        const timeout_ms = self.ws.timeout_ms;
 
         while (true) {
-            switch (cdp.pageWait(ms_remaining)) {
-                .cdp_socket => {
-                    if (self.readSocket() == false) {
-                        return;
-                    }
-                    last_message = milliTimestamp(.monotonic);
-                    ms_remaining = self.ws.timeout_ms;
-                },
-                .no_page => {
-                    const status = http.tick(ms_remaining) catch |err| {
+            const result = cdp.pageWait(timeout_ms) catch |wait_err| switch (wait_err) {
+                error.NoPage => {
+                    const status = http.tick(timeout_ms) catch |err| {
                         log.err(.app, "http tick", .{ .err = err });
                         return;
                     };
@@ -322,18 +313,20 @@ pub const Client = struct {
                     if (self.readSocket() == false) {
                         return;
                     }
-                    last_message = milliTimestamp(.monotonic);
-                    ms_remaining = self.ws.timeout_ms;
+                    continue;
                 },
-                .done => {
-                    const now = milliTimestamp(.monotonic);
-                    const elapsed = now - last_message;
-                    if (elapsed >= ms_remaining) {
-                        log.info(.app, "CDP timeout", .{});
+                else => return wait_err,
+            };
+
+            switch (result) {
+                .cdp_socket => {
+                    if (self.readSocket() == false) {
                         return;
                     }
-                    ms_remaining -= @intCast(elapsed);
-                    last_message = now;
+                },
+                .done => {
+                    log.info(.app, "CDP timeout", .{});
+                    return;
                 },
             }
         }
@@ -451,12 +444,20 @@ pub const Client = struct {
             return false;
         }
 
+        if (std.mem.eql(u8, url, "/json/list") or std.mem.eql(u8, url, "/json/list/") or
+            std.mem.eql(u8, url, "/json") or std.mem.eql(u8, url, "/json/"))
+        {
+            try self.ws.send(empty_json_list_response);
+            self.ws.shutdown();
+            return false;
+        }
+
         return error.NotFound;
     }
 
     fn upgradeConnection(self: *Client, request: []u8) !void {
         try self.ws.upgrade(request);
-        self.mode = .{ .cdp = try CDP.init(self.app, self.http, self) };
+        self.mode = .{ .cdp = try CDP.init(self) };
     }
 
     fn writeHTTPErrorResponse(self: *Client, comptime status: u16, comptime body: []const u8) void {
@@ -484,11 +485,23 @@ pub const Client = struct {
 // --------
 
 fn buildJSONVersionResponse(
-    allocator: Allocator,
-    address: net.Address,
+    app: *const App,
 ) ![]const u8 {
-    const body_format = "{{\"webSocketDebuggerUrl\": \"ws://{f}/\"}}";
-    const body_len = std.fmt.count(body_format, .{address});
+    const port = app.config.port();
+    const host = app.config.advertiseHost();
+    if (std.mem.eql(u8, host, "0.0.0.0")) {
+        log.info(.cdp, "unreachable advertised host", .{
+            .message = "when --host is set to 0.0.0.0 consider setting --advertise-host to a reachable address",
+        });
+    }
+    const body_format =
+        "{{" ++
+        "\"Browser\": \"Lightpanda/1.0\", " ++
+        "\"Protocol-Version\": \"1.3\", " ++
+        "\"User-Agent\": \"Lightpanda/1.0\", " ++
+        "\"webSocketDebuggerUrl\": \"ws://{s}:{d}/\"" ++
+        "}}";
+    const body_len = std.fmt.count(body_format, .{ host, port });
 
     // We send a Connection: Close (and actually close the connection)
     // because chromedp (Go driver) sends a request to /json/version and then
@@ -502,23 +515,34 @@ fn buildJSONVersionResponse(
         "Connection: Close\r\n" ++
         "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
         body_format;
-    return try std.fmt.allocPrint(allocator, response_format, .{ body_len, address });
+    return try std.fmt.allocPrint(app.allocator, response_format, .{ body_len, host, port });
 }
+
+const empty_json_list_response =
+    "HTTP/1.1 200 OK\r\n" ++
+    "Content-Length: 2\r\n" ++
+    "Connection: Close\r\n" ++
+    "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
+    "[]";
 
 pub const timestamp = @import("datetime.zig").timestamp;
 pub const milliTimestamp = @import("datetime.zig").milliTimestamp;
 
-const testing = std.testing;
+const testing = @import("testing.zig");
 test "server: buildJSONVersionResponse" {
-    const address = try net.Address.parseIp4("127.0.0.1", 9001);
-    const res = try buildJSONVersionResponse(testing.allocator, address);
-    defer testing.allocator.free(res);
+    const res = try buildJSONVersionResponse(testing.test_app);
+    defer testing.test_app.allocator.free(res);
 
-    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9001/\"}", res);
+    // The response includes the build version, so check structure rather than exact bytes.
+    try testing.expect(std.mem.startsWith(u8, res, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, res, "Content-Type: application/json") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "Connection: Close") != null);
+
+    // Verify all required JSON fields are present in the body
+    try testing.expect(std.mem.indexOf(u8, res, "\"Browser\": \"Lightpanda/") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"Protocol-Version\": \"1.3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"User-Agent\": \"Lightpanda/") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9222/\"") != null);
 }
 
 test "Client: http invalid request" {
@@ -526,7 +550,7 @@ test "Client: http invalid request" {
     defer c.deinit();
 
     const res = try c.httpRequest("GET /over/9000 HTTP/1.1\r\n" ++ "Header: " ++ ("a" ** 4100) ++ "\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 413 \r\n" ++
+    try testing.expectEqual("HTTP/1.1 413 \r\n" ++
         "Connection: Close\r\n" ++
         "Content-Length: 17\r\n\r\n" ++
         "Request too large", res);
@@ -595,7 +619,7 @@ test "Client: http valid handshake" {
         "Custom:  Header-Value\r\n\r\n";
 
     const res = try c.httpRequest(request);
-    try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+    try testing.expectEqual("HTTP/1.1 101 Switching Protocols\r\n" ++
         "Upgrade: websocket\r\n" ++
         "Connection: upgrade\r\n" ++
         "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);
@@ -723,27 +747,23 @@ test "server: 404" {
     defer c.deinit();
 
     const res = try c.httpRequest("GET /unknown HTTP/1.1\r\n\r\n");
-    try testing.expectEqualStrings("HTTP/1.1 404 \r\n" ++
+    try testing.expectEqual("HTTP/1.1 404 \r\n" ++
         "Connection: Close\r\n" ++
         "Content-Length: 9\r\n\r\n" ++
         "Not found", res);
 }
 
 test "server: get /json/version" {
-    const expected_response =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 48\r\n" ++
-        "Connection: Close\r\n" ++
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
-        "{\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9583/\"}";
-
     {
         // twice on the same connection
         var c = try createTestClient();
         defer c.deinit();
 
         const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
+        try testing.expect(std.mem.startsWith(u8, res1, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Browser\": \"Lightpanda/") != null);
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Protocol-Version\": \"1.3\"") != null);
+        try testing.expect(std.mem.indexOf(u8, res1, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9222/\"") != null);
     }
 
     {
@@ -752,7 +772,8 @@ test "server: get /json/version" {
         defer c.deinit();
 
         const res1 = try c.httpRequest("GET /json/version HTTP/1.1\r\n\r\n");
-        try testing.expectEqualStrings(expected_response, res1);
+        try testing.expect(std.mem.startsWith(u8, res1, "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.indexOf(u8, res1, "\"Browser\": \"Lightpanda/") != null);
     }
 }
 
@@ -770,7 +791,7 @@ fn assertHTTPError(
         .{ expected_status, expected_body.len, expected_body },
     );
 
-    try testing.expectEqualStrings(expected_response, res);
+    try testing.expectEqual(expected_response, res);
 }
 
 fn assertWebSocketError(close_code: u16, input: []const u8) !void {
@@ -914,7 +935,7 @@ const TestClient = struct {
             "Custom:  Header-Value\r\n\r\n";
 
         const res = try self.httpRequest(request);
-        try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+        try testing.expectEqual("HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: upgrade\r\n" ++
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);

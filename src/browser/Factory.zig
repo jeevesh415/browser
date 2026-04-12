@@ -239,7 +239,7 @@ fn eventInit(arena: Allocator, typ: String, value: anytype) !Event {
     const time_stamp = (raw_timestamp / 2) * 2;
 
     return .{
-        ._rc = 0,
+        ._rc = .{},
         ._arena = arena,
         ._type = unionInit(Event.Type, value),
         ._type_string = typ,
@@ -255,6 +255,7 @@ pub fn blob(_: *const Factory, arena: Allocator, child: anytype) !*@TypeOf(child
 
     const blob_ptr = chain.get(0);
     blob_ptr.* = .{
+        ._rc = .{},
         ._arena = arena,
         ._type = unionInit(Blob.Type, chain.get(1)),
         ._slice = "",
@@ -271,7 +272,7 @@ pub fn abstractRange(_: *const Factory, arena: Allocator, child: anytype, page: 
     const doc = page.document.asNode();
     const abstract_range = chain.get(0);
     abstract_range.* = AbstractRange{
-        ._rc = 0,
+        ._rc = .{},
         ._arena = arena,
         ._page_id = page.id,
         ._type = unionInit(AbstractRange.Type, chain.get(1)),
@@ -379,7 +380,7 @@ pub fn destroy(self: *Factory, value: anytype) void {
         // We should always destroy from the leaf down.
         if (@hasDecl(S, "_prototype_root")) {
             // A Event{._type == .generic} (or any other similar types)
-            // _should_ be destoyed directly. The _type = .generic is a pseudo
+            // _should_ be destroyed directly. The _type = .generic is a pseudo
             // child
             if (S != Event or value._type != .generic) {
                 log.fatal(.bug, "factory.destroy.event", .{ .type = @typeName(S) });

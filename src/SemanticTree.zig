@@ -47,7 +47,15 @@ pub fn jsonStringify(self: @This(), jw: *std.json.Stringify) error{WriteFailed}!
         log.err(.app, "listener map failed", .{ .err = err });
         return error.WriteFailed;
     };
-    self.walk(self.dom_node, &xpath_buffer, null, &visitor, 1, listener_targets, 0) catch |err| {
+    var visibility_cache: Element.VisibilityCache = .empty;
+    var pointer_events_cache: Element.PointerEventsCache = .empty;
+    var ctx: WalkContext = .{
+        .xpath_buffer = &xpath_buffer,
+        .listener_targets = listener_targets,
+        .visibility_cache = &visibility_cache,
+        .pointer_events_cache = &pointer_events_cache,
+    };
+    self.walk(&ctx, self.dom_node, null, &visitor, 1, 0) catch |err| {
         log.err(.app, "semantic tree json dump failed", .{ .err = err });
         return error.WriteFailed;
     };
@@ -60,7 +68,15 @@ pub fn textStringify(self: @This(), writer: *std.Io.Writer) error{WriteFailed}!v
         log.err(.app, "listener map failed", .{ .err = err });
         return error.WriteFailed;
     };
-    self.walk(self.dom_node, &xpath_buffer, null, &visitor, 1, listener_targets, 0) catch |err| {
+    var visibility_cache: Element.VisibilityCache = .empty;
+    var pointer_events_cache: Element.PointerEventsCache = .empty;
+    var ctx: WalkContext = .{
+        .xpath_buffer = &xpath_buffer,
+        .listener_targets = listener_targets,
+        .visibility_cache = &visibility_cache,
+        .pointer_events_cache = &pointer_events_cache,
+    };
+    self.walk(&ctx, self.dom_node, null, &visitor, 1, 0) catch |err| {
         log.err(.app, "semantic tree text dump failed", .{ .err = err });
         return error.WriteFailed;
     };
@@ -79,12 +95,29 @@ const NodeData = struct {
     name: ?[]const u8,
     value: ?[]const u8,
     options: ?[]OptionData = null,
+    checked: ?bool = null,
     xpath: []const u8,
-    is_interactive: bool,
-    node_name: []const u8,
+    interactive: bool,
+    disabled: bool,
+    tag_name: []const u8,
 };
 
-fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_name: ?[]const u8, visitor: anytype, index: usize, listener_targets: interactive.ListenerTargetMap, current_depth: u32) !void {
+const WalkContext = struct {
+    xpath_buffer: *std.ArrayList(u8),
+    listener_targets: interactive.ListenerTargetMap,
+    visibility_cache: *Element.VisibilityCache,
+    pointer_events_cache: *Element.PointerEventsCache,
+};
+
+fn walk(
+    self: @This(),
+    ctx: *WalkContext,
+    node: *Node,
+    parent_name: ?[]const u8,
+    visitor: anytype,
+    index: usize,
+    current_depth: u32,
+) !void {
     if (current_depth > self.max_depth) return;
 
     // 1. Skip non-content nodes
@@ -96,7 +129,7 @@ fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_nam
         if (tag == .datalist or tag == .option or tag == .optgroup) return;
 
         // Check visibility using the engine's checkVisibility which handles CSS display: none
-        if (!el.checkVisibility(self.page)) {
+        if (!el.checkVisibilityCached(ctx.visibility_cache, self.page)) {
             return;
         }
 
@@ -117,16 +150,21 @@ fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_nam
     const role = try axn.getRole();
 
     var is_interactive = false;
+    var is_disabled = false;
     var value: ?[]const u8 = null;
     var options: ?[]OptionData = null;
-    var node_name: []const u8 = "text";
+    var checked: ?bool = null;
+    var tag_name: []const u8 = "text";
 
     if (node.is(Element)) |el| {
-        node_name = el.getTagNameLower();
+        tag_name = el.getTagNameLower();
 
         if (el.is(Element.Html.Input)) |input| {
             value = input.getValue();
-            if (el.getAttributeSafe(comptime lp.String.wrap("list"))) |list_id| {
+            if (input._input_type == .checkbox or input._input_type == .radio) {
+                checked = input.getChecked();
+            }
+            if (el.getAttributeSafe(comptime .wrap("list"))) |list_id| {
                 options = try extractDataListOptions(list_id, self.page, self.arena);
             }
         } else if (el.is(Element.Html.TextArea)) |textarea| {
@@ -137,17 +175,19 @@ fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_nam
         }
 
         if (el.is(Element.Html)) |html_el| {
-            if (interactive.classifyInteractivity(el, html_el, listener_targets) != null) {
+            if (interactive.classifyInteractivity(self.page, el, html_el, ctx.listener_targets, ctx.pointer_events_cache) != null) {
                 is_interactive = true;
             }
         }
+
+        is_disabled = el.isDisabled();
     } else if (node._type == .document or node._type == .document_fragment) {
-        node_name = "root";
+        tag_name = "root";
     }
 
-    const initial_xpath_len = xpath_buffer.items.len;
-    try appendXPathSegment(node, xpath_buffer.writer(self.arena), index);
-    const xpath = xpath_buffer.items;
+    const initial_xpath_len = ctx.xpath_buffer.items.len;
+    try appendXPathSegment(node, ctx.xpath_buffer.writer(self.arena), index);
+    const xpath = ctx.xpath_buffer.items;
 
     var name = try axn.getName(self.page, self.arena);
 
@@ -164,18 +204,6 @@ fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_nam
     if (name != null and structural and !has_explicit_label) {
         name = null;
     }
-
-    var data = NodeData{
-        .id = cdp_node.id,
-        .axn = axn,
-        .role = role,
-        .name = name,
-        .value = value,
-        .options = options,
-        .xpath = xpath,
-        .is_interactive = is_interactive,
-        .node_name = node_name,
-    };
 
     var should_visit = true;
     if (self.interactive_only) {
@@ -208,6 +236,20 @@ fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_nam
 
     var did_visit = false;
     var should_walk_children = true;
+    var data: NodeData = .{
+        .id = cdp_node.id,
+        .axn = axn,
+        .role = role,
+        .name = name,
+        .value = value,
+        .options = options,
+        .checked = checked,
+        .xpath = xpath,
+        .interactive = is_interactive,
+        .disabled = is_disabled,
+        .tag_name = tag_name,
+    };
+
     if (should_visit) {
         should_walk_children = try visitor.visit(node, &data);
         did_visit = true; // Always true if should_visit was true, because visit() executed and opened structures
@@ -233,7 +275,7 @@ fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_nam
             }
             gop.value_ptr.* += 1;
 
-            try self.walk(child, xpath_buffer, name, visitor, gop.value_ptr.*, listener_targets, current_depth + 1);
+            try self.walk(ctx, child, name, visitor, gop.value_ptr.*, current_depth + 1);
         }
     }
 
@@ -241,11 +283,11 @@ fn walk(self: @This(), node: *Node, xpath_buffer: *std.ArrayList(u8), parent_nam
         try visitor.leave();
     }
 
-    xpath_buffer.shrinkRetainingCapacity(initial_xpath_len);
+    ctx.xpath_buffer.shrinkRetainingCapacity(initial_xpath_len);
 }
 
 fn extractSelectOptions(node: *Node, page: *Page, arena: std.mem.Allocator) ![]OptionData {
-    var options = std.ArrayListUnmanaged(OptionData){};
+    var options: std.ArrayList(OptionData) = .empty;
     var it = node.childrenIterator();
     while (it.next()) |child| {
         if (child.is(Element)) |el| {
@@ -304,7 +346,7 @@ const JsonVisitor = struct {
         try self.jw.write(data.id);
 
         try self.jw.objectField("nodeName");
-        try self.jw.write(data.node_name);
+        try self.jw.write(data.tag_name);
 
         try self.jw.objectField("xpath");
         try self.jw.write(data.xpath);
@@ -314,7 +356,12 @@ const JsonVisitor = struct {
             try self.jw.write(1);
 
             try self.jw.objectField("isInteractive");
-            try self.jw.write(data.is_interactive);
+            try self.jw.write(data.interactive);
+
+            if (data.disabled) {
+                try self.jw.objectField("isDisabled");
+                try self.jw.write(true);
+            }
 
             try self.jw.objectField("role");
             try self.jw.write(data.role);
@@ -340,6 +387,11 @@ const JsonVisitor = struct {
                     try self.jw.write(attr._value.str());
                 }
                 try self.jw.endObject();
+            }
+
+            if (data.checked) |checked| {
+                try self.jw.objectField("checked");
+                try self.jw.write(checked);
             }
 
             if (data.options) |options| {
@@ -428,6 +480,9 @@ const TextVisitor = struct {
         const is_text_only = std.mem.eql(u8, data.role, "StaticText") or std.mem.eql(u8, data.role, "none") or std.mem.eql(u8, data.role, "generic");
 
         try self.writer.print("{d}", .{data.id});
+        if (data.interactive) {
+            try self.writer.writeAll(if (data.disabled) " [i:disabled]" else " [i]");
+        }
         if (!is_text_only) {
             try self.writer.print(" {s}", .{data.role});
         }
@@ -438,6 +493,14 @@ const TextVisitor = struct {
         if (data.value) |v| {
             if (v.len > 0) {
                 try self.writer.print(" value='{s}'", .{v});
+            }
+        }
+
+        if (data.checked) |c| {
+            if (c) {
+                try self.writer.writeAll(" [checked]");
+            } else {
+                try self.writer.writeAll(" [unchecked]");
             }
         }
 
@@ -478,13 +541,189 @@ const TextVisitor = struct {
     }
 };
 
+pub const NodeDetails = struct {
+    backendNodeId: CDPNode.Id,
+    tag_name: []const u8,
+    role: []const u8,
+    name: ?[]const u8,
+    interactive: bool,
+    disabled: bool,
+    value: ?[]const u8 = null,
+    input_type: ?[]const u8 = null,
+    placeholder: ?[]const u8 = null,
+    href: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    class: ?[]const u8 = null,
+    checked: ?bool = null,
+    options: ?[]OptionData = null,
+
+    pub fn jsonStringify(self: *const NodeDetails, jw: anytype) !void {
+        try jw.beginObject();
+
+        try jw.objectField("backendNodeId");
+        try jw.write(self.backendNodeId);
+
+        try jw.objectField("tagName");
+        try jw.write(self.tag_name);
+
+        try jw.objectField("role");
+        try jw.write(self.role);
+
+        if (self.name) |n| {
+            try jw.objectField("name");
+            try jw.write(n);
+        }
+
+        try jw.objectField("isInteractive");
+        try jw.write(self.interactive);
+
+        if (self.disabled) {
+            try jw.objectField("isDisabled");
+            try jw.write(true);
+        }
+
+        if (self.value) |v| {
+            try jw.objectField("value");
+            try jw.write(v);
+        }
+
+        if (self.input_type) |v| {
+            try jw.objectField("inputType");
+            try jw.write(v);
+        }
+
+        if (self.placeholder) |v| {
+            try jw.objectField("placeholder");
+            try jw.write(v);
+        }
+
+        if (self.href) |v| {
+            try jw.objectField("href");
+            try jw.write(v);
+        }
+
+        if (self.id) |v| {
+            try jw.objectField("id");
+            try jw.write(v);
+        }
+
+        if (self.class) |v| {
+            try jw.objectField("class");
+            try jw.write(v);
+        }
+
+        if (self.checked) |c| {
+            try jw.objectField("checked");
+            try jw.write(c);
+        }
+
+        if (self.options) |opts| {
+            try jw.objectField("options");
+            try jw.beginArray();
+            for (opts) |opt| {
+                try jw.beginObject();
+                try jw.objectField("value");
+                try jw.write(opt.value);
+                try jw.objectField("text");
+                try jw.write(opt.text);
+                if (opt.selected) {
+                    try jw.objectField("selected");
+                    try jw.write(true);
+                }
+                try jw.endObject();
+            }
+            try jw.endArray();
+        }
+
+        try jw.endObject();
+    }
+};
+
+pub fn getNodeDetails(
+    arena: std.mem.Allocator,
+    node: *Node,
+    registry: *CDPNode.Registry,
+    page: *Page,
+) !NodeDetails {
+    const cdp_node = try registry.register(node);
+    const axn = AXNode.fromNode(node);
+    const role = try axn.getRole();
+    const name = try axn.getName(page, arena);
+
+    var is_interactive = false;
+    var is_disabled = false;
+    var tag_name: []const u8 = "text";
+    var value: ?[]const u8 = null;
+    var input_type: ?[]const u8 = null;
+    var placeholder: ?[]const u8 = null;
+    var href: ?[]const u8 = null;
+    var id_attr: ?[]const u8 = null;
+    var class_attr: ?[]const u8 = null;
+    var checked: ?bool = null;
+    var options: ?[]OptionData = null;
+
+    if (node.is(Element)) |el| {
+        tag_name = el.getTagNameLower();
+        is_disabled = el.isDisabled();
+        id_attr = el.getAttributeSafe(comptime .wrap("id"));
+        class_attr = el.getAttributeSafe(comptime .wrap("class"));
+        placeholder = el.getAttributeSafe(comptime .wrap("placeholder"));
+
+        if (el.getAttributeSafe(comptime .wrap("href"))) |h| {
+            const URL = lp.URL;
+            href = URL.resolve(arena, page.base(), h, .{ .encoding = page.charset }) catch h;
+        }
+
+        if (el.is(Element.Html.Input)) |input| {
+            value = input.getValue();
+            input_type = input._input_type.toString();
+            if (input._input_type == .checkbox or input._input_type == .radio) {
+                checked = input.getChecked();
+            }
+            if (el.getAttributeSafe(comptime .wrap("list"))) |list_id| {
+                options = try extractDataListOptions(list_id, page, arena);
+            }
+        } else if (el.is(Element.Html.TextArea)) |textarea| {
+            value = textarea.getValue();
+        } else if (el.is(Element.Html.Select)) |select| {
+            value = select.getValue(page);
+            options = try extractSelectOptions(el.asNode(), page, arena);
+        }
+
+        if (el.is(Element.Html)) |html_el| {
+            const listener_targets = try interactive.buildListenerTargetMap(page, arena);
+            var pointer_events_cache: Element.PointerEventsCache = .empty;
+            if (interactive.classifyInteractivity(page, el, html_el, listener_targets, &pointer_events_cache) != null) {
+                is_interactive = true;
+            }
+        }
+    }
+
+    return .{
+        .backendNodeId = cdp_node.id,
+        .tag_name = tag_name,
+        .role = role,
+        .name = name,
+        .interactive = is_interactive,
+        .disabled = is_disabled,
+        .value = value,
+        .input_type = input_type,
+        .placeholder = placeholder,
+        .href = href,
+        .id = id_attr,
+        .class = class_attr,
+        .checked = checked,
+        .options = options,
+    };
+}
+
 const testing = @import("testing.zig");
 
 test "SemanticTree backendDOMNodeId" {
     var registry: CDPNode.Registry = .init(testing.allocator);
     defer registry.deinit();
 
-    var page = try testing.pageTest("cdp/registry1.html");
+    var page = try testing.pageTest("cdp/registry1.html", .{});
     defer testing.reset();
     defer page._session.removePage();
 
@@ -508,7 +747,7 @@ test "SemanticTree max_depth" {
     var registry: CDPNode.Registry = .init(testing.allocator);
     defer registry.deinit();
 
-    var page = try testing.pageTest("cdp/registry1.html");
+    var page = try testing.pageTest("cdp/registry1.html", .{});
     defer testing.reset();
     defer page._session.removePage();
 

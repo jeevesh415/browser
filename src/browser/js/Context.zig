@@ -21,8 +21,8 @@ const lp = @import("lightpanda");
 const log = @import("../../log.zig");
 
 const js = @import("js.zig");
-const Env = @import("Env.zig");
 const bridge = @import("bridge.zig");
+const Env = @import("Env.zig");
 const Origin = @import("Origin.zig");
 const Scheduler = @import("Scheduler.zig");
 
@@ -63,7 +63,9 @@ templates: []*const v8.FunctionTemplate,
 // Arena for the lifetime of the context
 arena: Allocator,
 
-// The page.call_arena
+// The call_arena for this context. For main world contexts this is
+// page.call_arena. For isolated world contexts this is a separate arena
+// owned by the IsolatedWorld.
 call_arena: Allocator,
 
 // Because calls can be nested (i.e.a function calling a callback),
@@ -78,6 +80,16 @@ call_depth: usize = 0,
 local: ?*const js.Local = null,
 
 origin: *Origin,
+
+// Identity tracking for this context. For main world contexts, this points to
+// Session's Identity. For isolated world contexts (CDP inspector), this points
+// to IsolatedWorld's Identity. This ensures same-origin frames share object
+// identity while isolated worlds have separate identity tracking.
+identity: *js.Identity,
+
+// Allocator to use for identity map operations. For main world contexts this is
+// session.page_arena, for isolated worlds it's the isolated world's arena.
+identity_arena: Allocator,
 
 // Unlike other v8 types, like functions or objects, modules are not shared
 // across origins.
@@ -102,7 +114,7 @@ scheduler: Scheduler,
 unknown_properties: (if (IS_DEBUG) std.StringHashMapUnmanaged(UnknownPropertyStat) else void) = if (IS_DEBUG) .{} else {},
 
 const ModuleEntry = struct {
-    // Can be null if we're asynchrously loading the module, in
+    // Can be null if we're asynchronously loading the module, in
     // which case resolver_promise cannot be null.
     module: ?js.Module.Global = null,
 
@@ -126,7 +138,8 @@ pub fn fromC(c_context: *const v8.Context) ?*Context {
 /// Returns the Context and v8::Context for the given isolate.
 /// If the current context is from a destroyed Context (e.g., navigated-away iframe),
 /// falls back to the incumbent context (the calling context).
-pub fn fromIsolate(isolate: js.Isolate) struct { *Context, *const v8.Context } {
+/// Returns null if neither context has a valid Context struct (both were destroyed).
+pub fn fromIsolate(isolate: js.Isolate) ?struct { *Context, *const v8.Context } {
     const v8_context = v8.v8__Isolate__GetCurrentContext(isolate.handle).?;
     if (fromC(v8_context)) |ctx| {
         return .{ ctx, v8_context };
@@ -134,7 +147,8 @@ pub fn fromIsolate(isolate: js.Isolate) struct { *Context, *const v8.Context } {
     // The current context's Context struct has been freed (e.g., iframe navigated away).
     // Fall back to the incumbent context (the calling context).
     const v8_incumbent = v8.v8__Isolate__GetIncumbentContext(isolate.handle).?;
-    return .{ fromC(v8_incumbent).?, v8_incumbent };
+    const ctx = fromC(v8_incumbent) orelse return null;
+    return .{ ctx, v8_incumbent };
 }
 
 pub fn deinit(self: *Context) void {
@@ -185,9 +199,8 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
     lp.assert(self.origin.rc == 1, "Ref opaque origin", .{ .rc = self.origin.rc });
 
     const origin = try self.session.getOrCreateOrigin(key);
-    errdefer self.session.releaseOrigin(origin);
-    try origin.takeover(self.origin);
 
+    self.session.releaseOrigin(self.origin);
     self.origin = origin;
 
     {
@@ -203,48 +216,24 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
 }
 
 pub fn trackGlobal(self: *Context, global: v8.Global) !void {
-    return self.origin.trackGlobal(global);
+    return self.session.globals.append(self.session.page_arena, global);
 }
 
 pub fn trackTemp(self: *Context, global: v8.Global) !void {
-    return self.origin.trackTemp(global);
+    return self.session.temps.put(self.session.page_arena, global.data_ptr, global);
 }
 
-pub fn weakRef(self: *Context, obj: anytype) void {
-    const resolved = js.Local.resolveValue(obj);
-    const fc = self.origin.finalizer_callbacks.get(@intFromPtr(resolved.ptr)) orelse {
-        if (comptime IS_DEBUG) {
-            // should not be possible
-            std.debug.assert(false);
-        }
-        return;
-    };
-    v8.v8__Global__SetWeakFinalizer(&fc.global, fc, resolved.finalizer_from_v8, v8.kParameter);
-}
+pub const IdentityResult = struct {
+    value_ptr: *v8.Global,
+    found_existing: bool,
+};
 
-pub fn safeWeakRef(self: *Context, obj: anytype) void {
-    const resolved = js.Local.resolveValue(obj);
-    const fc = self.origin.finalizer_callbacks.get(@intFromPtr(resolved.ptr)) orelse {
-        if (comptime IS_DEBUG) {
-            // should not be possible
-            std.debug.assert(false);
-        }
-        return;
+pub fn addIdentity(self: *Context, ptr: usize) !IdentityResult {
+    const gop = try self.identity.identity_map.getOrPut(self.identity_arena, ptr);
+    return .{
+        .value_ptr = gop.value_ptr,
+        .found_existing = gop.found_existing,
     };
-    v8.v8__Global__ClearWeak(&fc.global);
-    v8.v8__Global__SetWeakFinalizer(&fc.global, fc, resolved.finalizer_from_v8, v8.kParameter);
-}
-
-pub fn strongRef(self: *Context, obj: anytype) void {
-    const resolved = js.Local.resolveValue(obj);
-    const fc = self.origin.finalizer_callbacks.get(@intFromPtr(resolved.ptr)) orelse {
-        if (comptime IS_DEBUG) {
-            // should not be possible
-            std.debug.assert(false);
-        }
-        return;
-    };
-    v8.v8__Global__ClearWeak(&fc.global);
 }
 
 // Any operation on the context have to be made from a local.
@@ -545,13 +534,13 @@ pub fn dynamicModuleCallback(
 
         break :blk js.String.toSliceZ(.{ .local = &local, .handle = resource_name.? }) catch |err| {
             log.err(.app, "OOM", .{ .err = err, .src = "dynamicModuleCallback1" });
-            return @constCast((local.rejectPromise("Out of memory") catch return null).handle);
+            return @constCast(local.rejectPromise(.{ .generic_error = "Out of memory" }).handle);
         };
     };
 
     const specifier = js.String.toSliceZ(.{ .local = &local, .handle = v8_specifier.? }) catch |err| {
         log.err(.app, "OOM", .{ .err = err, .src = "dynamicModuleCallback2" });
-        return @constCast((local.rejectPromise("Out of memory") catch return null).handle);
+        return @constCast(local.rejectPromise(.{ .generic_error = "Out of memory" }).handle);
     };
 
     const normalized_specifier = self.script_manager.?.resolveSpecifier(
@@ -560,14 +549,14 @@ pub fn dynamicModuleCallback(
         specifier,
     ) catch |err| {
         log.err(.app, "OOM", .{ .err = err, .src = "dynamicModuleCallback3" });
-        return @constCast((local.rejectPromise("Out of memory") catch return null).handle);
+        return @constCast(local.rejectPromise(.{ .generic_error = "Out of memory" }).handle);
     };
 
     const promise = self._dynamicModuleCallback(normalized_specifier, resource, &local) catch |err| blk: {
         log.err(.js, "dynamic module callback", .{
             .err = err,
         });
-        break :blk local.rejectPromise("Failed to load module") catch return null;
+        break :blk local.rejectPromise(.{ .generic_error = "Out of memory" });
     };
     return @constCast(promise.handle);
 }
@@ -755,7 +744,7 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
     // since we're going to be doing all the work.
     entry.resolver_promise = try promise.persist();
 
-    // But we can skip direclty to `resolveDynamicModule` which is
+    // But we can skip directly to `resolveDynamicModule` which is
     // what the above callback will eventually do.
     self.resolveDynamicModule(state, entry.*, local);
     return promise;
@@ -819,7 +808,9 @@ fn resolveDynamicModule(self: *Context, state: *DynamicModuleResolveState, modul
     const then_callback = newFunctionWithData(local, struct {
         pub fn callback(callback_handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
             var c: Caller = undefined;
-            c.initFromHandle(callback_handle);
+            if (!c.initFromHandle(callback_handle)) {
+                return;
+            }
             defer c.deinit();
 
             const info = Caller.FunctionCallbackInfo{ .handle = callback_handle.? };
@@ -843,7 +834,7 @@ fn resolveDynamicModule(self: *Context, state: *DynamicModuleResolveState, modul
     const catch_callback = newFunctionWithData(local, struct {
         pub fn callback(callback_handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
             var c: Caller = undefined;
-            c.initFromHandle(callback_handle);
+            if (!c.initFromHandle(callback_handle)) return;
             defer c.deinit();
 
             const info = Caller.FunctionCallbackInfo{ .handle = callback_handle.? };

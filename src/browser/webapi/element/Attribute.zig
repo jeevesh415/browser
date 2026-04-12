@@ -26,6 +26,8 @@ const GenericIterator = @import("../collections/iterator.zig").Entry;
 const Page = @import("../../Page.zig");
 const String = @import("../../../string.zig").String;
 
+const Allocator = std.mem.Allocator;
+
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
 pub fn registerTypes() []const type {
@@ -113,7 +115,7 @@ pub const JsApi = struct {
 // imagine a page will have tens of thousands of attributes, and it's very likely
 // that page will _never_ load a single Attribute. It might get a string value
 // from a string key, but it won't load the full Attribute. And, even if it does,
-// it will almost certainly load realtively few.
+// it will almost certainly load relatively few.
 // The main issue with Attribute is that it's a full Node -> EventTarget. It's
 // _huge_ for something that's essentially just name=>value.
 // That said, we need identity. el.getAttributeNode("id") should return the same
@@ -232,7 +234,7 @@ pub const List = struct {
     }
 
     // Optimized for cloning. We know `name` is already normalized. We know there isn't duplicates.
-    // We know the Element is detatched (and thus, don't need to check for `id`).
+    // We know the Element is detached (and thus, don't need to check for `id`).
     pub fn putForCloned(self: *List, name: []const u8, value: []const u8, page: *Page) !void {
         const entry = try page._factory.create(Entry{
             ._node = .{},
@@ -264,7 +266,7 @@ pub const List = struct {
     // called form our parser, names already lower-cased
     pub fn putNew(self: *List, name: []const u8, value: []const u8, page: *Page) !void {
         if (try self.getEntry(.wrap(name), page) != null) {
-            // When parsing, if there are dupicate names, it isn't valid, and
+            // When parsing, if there are duplicate names, it isn't valid, and
             // the first is kept
             return;
         }
@@ -419,7 +421,7 @@ pub fn validateAttributeName(name: String) !void {
     }
 }
 
-pub fn normalizeNameForLookup(name: String, page: *Page) !String {
+fn normalizeNameForLookup(name: String, page: *Page) !String {
     if (!needsLowerCasing(name.str())) {
         return name;
     }
@@ -428,6 +430,14 @@ pub fn normalizeNameForLookup(name: String, page: *Page) !String {
     else
         try std.ascii.allocLowerString(page.call_arena, name.str());
 
+    return .wrap(normalized);
+}
+
+pub fn normalizeNameForLookupAlloc(allocator: Allocator, name: String) !String {
+    if (!needsLowerCasing(name.str())) {
+        return name.dupe(allocator);
+    }
+    const normalized = try std.ascii.allocLowerString(allocator, name.str());
     return .wrap(normalized);
 }
 

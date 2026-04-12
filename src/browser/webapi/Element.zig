@@ -24,6 +24,7 @@ const String = @import("../../string.zig").String;
 
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
+const StyleManager = @import("../StyleManager.zig");
 const reflect = @import("../reflect.zig");
 
 const Node = @import("Node.zig");
@@ -82,7 +83,7 @@ pub const Namespace = enum(u8) {
     pub fn parse(namespace_: ?[]const u8) Namespace {
         const namespace = namespace_ orelse return .null;
         if (namespace.len == "http://www.w3.org/1999/xhtml".len) {
-            // Common case, avoid the string comparion. Recklessly
+            // Common case, avoid the string comparison. Recklessly
             @branchHint(.likely);
             return .html;
         }
@@ -522,6 +523,31 @@ pub fn setDir(self: *Element, value: []const u8, page: *Page) !void {
     return self.setAttributeSafe(comptime .wrap("dir"), .wrap(value), page);
 }
 
+// ARIAMixin - ARIA attribute reflection
+pub fn getAriaAtomic(self: *const Element) ?[]const u8 {
+    return self.getAttributeSafe(comptime .wrap("aria-atomic"));
+}
+
+pub fn setAriaAtomic(self: *Element, value: ?[]const u8, page: *Page) !void {
+    if (value) |v| {
+        try self.setAttributeSafe(comptime .wrap("aria-atomic"), .wrap(v), page);
+    } else {
+        try self.removeAttribute(comptime .wrap("aria-atomic"), page);
+    }
+}
+
+pub fn getAriaLive(self: *const Element) ?[]const u8 {
+    return self.getAttributeSafe(comptime .wrap("aria-live"));
+}
+
+pub fn setAriaLive(self: *Element, value: ?[]const u8, page: *Page) !void {
+    if (value) |v| {
+        try self.setAttributeSafe(comptime .wrap("aria-live"), .wrap(v), page);
+    } else {
+        try self.removeAttribute(comptime .wrap("aria-live"), page);
+    }
+}
+
 pub fn getClassName(self: *const Element) []const u8 {
     return self.getAttributeSafe(comptime .wrap("class")) orelse "";
 }
@@ -570,6 +596,32 @@ pub fn hasAttribute(self: *const Element, name: String, page: *Page) !bool {
 pub fn hasAttributeSafe(self: *const Element, name: String) bool {
     const attributes = self._attributes orelse return false;
     return attributes.hasSafe(name);
+}
+
+pub fn isDisabled(self: *Element) bool {
+    if (self.getAttributeSafe(comptime .wrap("disabled")) != null) {
+        return true;
+    }
+
+    const element_node = self.asNode();
+    var current: ?*Node = element_node._parent;
+    while (current) |node| {
+        current = node._parent;
+        const ancestor = node.is(Element) orelse continue;
+
+        if (ancestor.getTag() == .fieldset and ancestor.getAttributeSafe(comptime .wrap("disabled")) != null) {
+            var child = ancestor.firstElementChild();
+            while (child) |c| {
+                if (c.getTag() == .legend) {
+                    if (c.asNode().contains(element_node)) return false;
+                    break;
+                }
+                child = c.nextElementSibling();
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 pub fn hasAttributes(self: *const Element) bool {
@@ -784,24 +836,7 @@ pub fn getDataset(self: *Element, page: *Page) !*DOMStringMap {
 }
 
 pub fn replaceChildren(self: *Element, nodes: []const Node.NodeOrText, page: *Page) !void {
-    page.domChanged();
-    var parent = self.asNode();
-
-    var it = parent.childrenIterator();
-    while (it.next()) |child| {
-        page.removeNode(parent, child, .{ .will_be_reconnected = false });
-    }
-
-    const parent_is_connected = parent.isConnected();
-    for (nodes) |node_or_text| {
-        var child_connected = false;
-        const child = try node_or_text.toNode(page);
-        if (child._parent) |previous_parent| {
-            child_connected = child.isConnected();
-            page.removeNode(previous_parent, child, .{ .will_be_reconnected = parent_is_connected });
-        }
-        try page.appendNode(parent, child, .{ .child_already_connected = child_connected });
-    }
+    return self.asNode().replaceChildren(nodes, page);
 }
 
 pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, page: *Page) !void {
@@ -812,7 +847,7 @@ pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, page: *Page) 
 
     const parent_is_connected = parent.isConnected();
 
-    // Detect if the ref_node must be removed (byt default) or kept.
+    // Detect if the ref_node must be removed (by default) or kept.
     // We kept it when ref_node is present into the nodes list.
     var rm_ref_node = true;
 
@@ -1041,20 +1076,32 @@ pub fn parentElement(self: *Element) ?*Element {
     return self._proto.parentElement();
 }
 
-pub fn checkVisibility(self: *Element, page: *Page) bool {
-    var current: ?*Element = self;
+/// Cache for visibility checks - re-exported from StyleManager for convenience.
+pub const VisibilityCache = StyleManager.VisibilityCache;
 
-    while (current) |el| {
-        if (el.getStyle(page)) |style| {
-            const display = style.asCSSStyleDeclaration().getPropertyValue("display", page);
-            if (std.mem.eql(u8, display, "none")) {
-                return false;
-            }
-        }
-        current = el.parentElement();
-    }
+/// Cache for pointer-events checks - re-exported from StyleManager for convenience.
+pub const PointerEventsCache = StyleManager.PointerEventsCache;
 
-    return true;
+pub fn hasPointerEventsNone(self: *Element, cache: ?*PointerEventsCache, page: *Page) bool {
+    return page._style_manager.hasPointerEventsNone(self, cache);
+}
+
+pub fn checkVisibilityCached(self: *Element, cache: ?*VisibilityCache, page: *Page) bool {
+    return !page._style_manager.isHidden(self, cache, .{});
+}
+
+const CheckVisibilityOpts = struct {
+    checkOpacity: bool = false,
+    opacityProperty: bool = false,
+    checkVisibilityCSS: bool = false,
+    visibilityProperty: bool = false,
+};
+pub fn checkVisibility(self: *Element, opts_: ?CheckVisibilityOpts, page: *Page) bool {
+    const opts = opts_ orelse CheckVisibilityOpts{};
+    return !page._style_manager.isHidden(self, null, .{
+        .check_opacity = opts.checkOpacity or opts.opacityProperty,
+        .check_visibility = opts.visibilityProperty or opts.checkVisibilityCSS,
+    });
 }
 
 fn getElementDimensions(self: *Element, page: *Page) struct { width: f64, height: f64 } {
@@ -1091,7 +1138,7 @@ fn getElementDimensions(self: *Element, page: *Page) struct { width: f64, height
 }
 
 pub fn getClientWidth(self: *Element, page: *Page) f64 {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return 0.0;
     }
     const dims = self.getElementDimensions(page);
@@ -1099,7 +1146,7 @@ pub fn getClientWidth(self: *Element, page: *Page) f64 {
 }
 
 pub fn getClientHeight(self: *Element, page: *Page) f64 {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return 0.0;
     }
     const dims = self.getElementDimensions(page);
@@ -1107,7 +1154,7 @@ pub fn getClientHeight(self: *Element, page: *Page) f64 {
 }
 
 pub fn getBoundingClientRect(self: *Element, page: *Page) DOMRect {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return .{
             ._x = 0.0,
             ._y = 0.0,
@@ -1137,7 +1184,7 @@ pub fn getBoundingClientRectForVisible(self: *Element, page: *Page) DOMRect {
 }
 
 pub fn getClientRects(self: *Element, page: *Page) ![]DOMRect {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return &.{};
     }
     const rects = try page.call_arena.alloc(DOMRect, 1);
@@ -1182,7 +1229,7 @@ pub fn getScrollWidth(self: *Element, page: *Page) f64 {
 }
 
 pub fn getOffsetHeight(self: *Element, page: *Page) f64 {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return 0.0;
     }
     const dims = self.getElementDimensions(page);
@@ -1190,7 +1237,7 @@ pub fn getOffsetHeight(self: *Element, page: *Page) f64 {
 }
 
 pub fn getOffsetWidth(self: *Element, page: *Page) f64 {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return 0.0;
     }
     const dims = self.getElementDimensions(page);
@@ -1198,14 +1245,14 @@ pub fn getOffsetWidth(self: *Element, page: *Page) f64 {
 }
 
 pub fn getOffsetTop(self: *Element, page: *Page) f64 {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return 0.0;
     }
     return calculateDocumentPosition(self.asNode());
 }
 
 pub fn getOffsetLeft(self: *Element, page: *Page) f64 {
-    if (!self.checkVisibility(page)) {
+    if (!self.checkVisibilityCached(null, page)) {
         return 0.0;
     }
     return calculateSiblingPosition(self.asNode());
@@ -1664,6 +1711,8 @@ pub const JsApi = struct {
     pub const localName = bridge.accessor(Element.getLocalName, null, .{});
     pub const id = bridge.accessor(Element.getId, Element.setId, .{});
     pub const slot = bridge.accessor(Element.getSlot, Element.setSlot, .{});
+    pub const ariaAtomic = bridge.accessor(Element.getAriaAtomic, Element.setAriaAtomic, .{});
+    pub const ariaLive = bridge.accessor(Element.getAriaLive, Element.setAriaLive, .{});
     pub const dir = bridge.accessor(Element.getDir, Element.setDir, .{});
     pub const className = bridge.accessor(Element.getClassName, Element.setClassName, .{});
     pub const classList = bridge.accessor(Element.getClassList, Element.setClassList, .{});

@@ -35,7 +35,7 @@ pub const ParsedNode = struct {
     // Data associated with this element to be passed back to html5ever as needed
     // We only have this for Elements. For other types, like comments, it's null.
     // html5ever should never ask us for this data on a non-element, and we'll
-    // assert that, with this opitonal, to make sure our assumption is correct.
+    // assert that, with this optional, to make sure our assumption is correct.
     data: ?*anyopaque,
 };
 
@@ -84,6 +84,32 @@ pub fn parse(self: *Parser, html: []const u8) void {
     h5e.html5ever_parse_document(
         html.ptr,
         html.len,
+        &self.container,
+        self,
+        createElementCallback,
+        getDataCallback,
+        appendCallback,
+        parseErrorCallback,
+        popCallback,
+        createCommentCallback,
+        createProcessingInstruction,
+        appendDoctypeToDocument,
+        addAttrsIfMissingCallback,
+        getTemplateContentsCallback,
+        removeFromParentCallback,
+        reparentChildrenCallback,
+        appendBeforeSiblingCallback,
+        appendBasedOnParentNodeCallback,
+    );
+}
+
+/// Parse HTML with encoding conversion. Converts from charset to UTF-8 before parsing.
+pub fn parseWithEncoding(self: *Parser, html: []const u8, charset: []const u8) void {
+    h5e.html5ever_parse_document_with_encoding(
+        html.ptr,
+        html.len,
+        charset.ptr,
+        charset.len,
         &self.container,
         self,
         createElementCallback,

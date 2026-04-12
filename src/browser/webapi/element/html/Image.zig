@@ -5,10 +5,6 @@ const URL = @import("../../../URL.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
-const Event = @import("../../Event.zig");
-const log = @import("../../../../log.zig");
-
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Image = @This();
 _proto: *HtmlElement,
@@ -44,9 +40,7 @@ pub fn getSrc(self: *const Image, page: *Page) ![]const u8 {
     if (src.len == 0) {
         return "";
     }
-
-    // Always resolve the src against the page URL
-    return URL.resolve(page.call_arena, page.base(), src, .{ .encode = true });
+    return element.asConstNode().resolveURL(src, page, .{});
 }
 
 pub fn setSrc(self: *Image, value: []const u8, page: *Page) !void {
@@ -150,6 +144,7 @@ pub const JsApi = struct {
 
     pub const constructor = bridge.constructor(Image.constructor, .{});
     pub const src = bridge.accessor(Image.getSrc, Image.setSrc, .{});
+    pub const currentSrc = bridge.accessor(Image.getSrc, null, .{});
     pub const alt = bridge.accessor(Image.getAlt, Image.setAlt, .{});
     pub const width = bridge.accessor(Image.getWidth, Image.setWidth, .{});
     pub const height = bridge.accessor(Image.getHeight, Image.setHeight, .{});

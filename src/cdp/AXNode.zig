@@ -28,7 +28,7 @@ const Node = @import("Node.zig");
 const AXNode = @This();
 
 // Need a custom writer, because we can't just serialize the node as-is.
-// Sometimes we want to serializ the node without chidren, sometimes with just
+// Sometimes we want to serializ the node without children, sometimes with just
 // its direct children, and sometimes the entire tree.
 // (For now, we only support direct children)
 pub const Writer = struct {
@@ -295,7 +295,7 @@ pub const Writer = struct {
                 },
                 .input => {
                     const input = el.as(DOMNode.Element.Html.Input);
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
 
                     switch (input._input_type) {
                         .text, .email, .tel, .url, .search, .password, .number => {
@@ -332,7 +332,7 @@ pub const Writer = struct {
                     }
                 },
                 .textarea => {
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
 
                     try self.writeAXProperty(.{ .name = .invalid, .value = .{ .token = "false" } }, w);
                     if (!is_disabled) {
@@ -347,7 +347,7 @@ pub const Writer = struct {
                     try self.writeAXProperty(.{ .name = .required, .value = .{ .boolean = el.hasAttributeSafe(comptime .wrap("required")) } }, w);
                 },
                 .select => {
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
 
                     try self.writeAXProperty(.{ .name = .invalid, .value = .{ .token = "false" } }, w);
                     if (!is_disabled) {
@@ -391,7 +391,7 @@ pub const Writer = struct {
                     }
                 },
                 .button => {
-                    const is_disabled = el.hasAttributeSafe(comptime .wrap("disabled"));
+                    const is_disabled = el.isDisabled();
                     try self.writeAXProperty(.{ .name = .invalid, .value = .{ .token = "false" } }, w);
                     if (!is_disabled) {
                         try self.writeAXProperty(.{ .name = .focusable, .value = .{ .booleanOrUndefined = true } }, w);
@@ -1091,7 +1091,7 @@ pub fn getRole(self: AXNode) ![]const u8 {
     return @tagName(role_implicit);
 }
 
-// Replace successives whitespaces with one withespace.
+// Replace successives whitespaces with one whitespace.
 // Trims left and right according to the options.
 // Returns true if the string ends with a trimmed whitespace.
 fn writeString(s: []const u8, w: anytype) !void {
@@ -1179,7 +1179,7 @@ test "AXNode: writer" {
     var registry = Node.Registry.init(testing.allocator);
     defer registry.deinit();
 
-    var page = try testing.pageTest("cdp/dom3.html");
+    var page = try testing.pageTest("cdp/dom3.html", .{});
     defer page._session.removePage();
     var doc = page.window._document;
 

@@ -22,6 +22,7 @@ const String = @import("../../string.zig").String;
 
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
+const URL = @import("../URL.zig");
 const reflect = @import("../reflect.zig");
 
 const EventTarget = @import("EventTarget.zig");
@@ -509,6 +510,18 @@ pub fn ownerDocument(self: *const Node, page: *const Page) ?*Document {
 pub fn ownerPage(self: *const Node, default: *Page) *Page {
     const doc = self.ownerDocument(default) orelse return default;
     return doc._page orelse default;
+}
+
+pub const ResolveURLOpts = struct {
+    allocator: ?Allocator = null,
+};
+
+// Resolve a URL relative to this node's owning document.
+// Uses the document's charset for query string encoding (with NCR fallback for unmappable chars).
+pub fn resolveURL(self: *const Node, url: anytype, page: *Page, opts: ResolveURLOpts) ![:0]const u8 {
+    const owner_page = self.ownerPage(page);
+    const allocator = opts.allocator orelse page.call_arena;
+    return URL.resolve(allocator, owner_page.base(), url, .{ .encoding = owner_page.charset });
 }
 
 pub fn isSameDocumentAs(self: *const Node, other: *const Node, page: *const Page) bool {
@@ -1003,6 +1016,49 @@ pub fn getElementsByClassName(self: *Node, class_name: []const u8, page: *Page) 
     }
 
     return collections.NodeLive(.class_name).init(self, class_names.items, page);
+}
+
+/// Shared implementation of replaceChildren for Element, Document, and DocumentFragment.
+/// Validates all nodes, removes existing children, then appends new children.
+pub fn replaceChildren(self: *Node, nodes: []const NodeOrText, page: *Page) !void {
+    // First pass: validate all nodes and collect them
+    // We need to collect because DocumentFragments contribute their children, not themselves
+    var children_to_add: std.ArrayList(*Node) = .empty;
+
+    for (nodes) |node_or_text| {
+        const child = try node_or_text.toNode(page);
+
+        // DocumentFragments contribute their children, not themselves
+        if (child.is(DocumentFragment)) |frag| {
+            var frag_it = frag.asNode().childrenIterator();
+            while (frag_it.next()) |frag_child| {
+                try validateNodeInsertion(self, frag_child);
+                try children_to_add.append(page.call_arena, frag_child);
+            }
+        } else {
+            try validateNodeInsertion(self, child);
+            try children_to_add.append(page.call_arena, child);
+        }
+    }
+
+    page.domChanged();
+
+    // Remove all existing children
+    var it = self.childrenIterator();
+    while (it.next()) |child| {
+        page.removeNode(self, child, .{ .will_be_reconnected = false });
+    }
+
+    // Append new children
+    const parent_is_connected = self.isConnected();
+    for (children_to_add.items) |child| {
+        var child_connected = false;
+        if (child._parent) |previous_parent| {
+            child_connected = child.isConnected();
+            page.removeNode(previous_parent, child, .{ .will_be_reconnected = parent_is_connected });
+        }
+        try page.appendNode(self, child, .{ .child_already_connected = child_connected });
+    }
 }
 
 // Writes a JSON representation of the node and its children

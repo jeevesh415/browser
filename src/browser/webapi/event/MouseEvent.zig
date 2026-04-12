@@ -34,7 +34,7 @@ const MouseEvent = @This();
 
 pub const MouseButton = enum(u8) {
     main = 0,
-    auxillary = 1,
+    auxiliary = 1,
     secondary = 2,
     fourth = 3,
     fifth = 4,
@@ -82,14 +82,14 @@ pub const Options = Event.inheritOptions(
 );
 
 pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*MouseEvent {
-    const arena = try page.getArena(.{ .debug = "MouseEvent" });
+    const arena = try page.getArena(.tiny, "MouseEvent");
     errdefer page.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
     return initWithTrusted(arena, type_string, _opts, false, page);
 }
 
 pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*MouseEvent {
-    const arena = try page.getArena(.{ .debug = "MouseEvent.trusted" });
+    const arena = try page.getArena(.tiny, "MouseEvent.trusted");
     errdefer page.releaseArena(arena);
     return initWithTrusted(arena, typ, _opts, true, page);
 }
@@ -119,10 +119,6 @@ fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool
 
     Event.populatePrototypes(event, opts, trusted);
     return event;
-}
-
-pub fn deinit(self: *MouseEvent, shutdown: bool, session: *Session) void {
-    self._proto.deinit(shutdown, session);
 }
 
 pub fn asEvent(self: *MouseEvent) *Event {
@@ -203,8 +199,6 @@ pub const JsApi = struct {
         pub const name = "MouseEvent";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(MouseEvent.deinit);
     };
 
     pub const constructor = bridge.constructor(MouseEvent.init, .{});

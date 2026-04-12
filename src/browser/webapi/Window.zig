@@ -49,6 +49,10 @@ const IS_DEBUG = builtin.mode == .Debug;
 
 const Allocator = std.mem.Allocator;
 
+pub fn registerTypes() []const type {
+    return &.{ Window, CrossOriginWindow };
+}
+
 const Window = @This();
 
 _proto: *EventTarget,
@@ -67,7 +71,8 @@ _on_pageshow: ?js.Function.Global = null,
 _on_popstate: ?js.Function.Global = null,
 _on_error: ?js.Function.Global = null,
 _on_message: ?js.Function.Global = null,
-_on_unhandled_rejection: ?js.Function.Global = null, // TODO: invoke on error
+_on_rejection_handled: ?js.Function.Global = null,
+_on_unhandled_rejection: ?js.Function.Global = null,
 _current_event: ?*Event = null,
 _location: *Location,
 _timer_id: u30 = 0,
@@ -86,6 +91,8 @@ _scroll_pos: struct {
     .y = 0,
     .state = .done,
 },
+// A cross origin wrapper for this window
+_cross_origin_wrapper: CrossOriginWindow,
 
 pub fn asEventTarget(self: *Window) *EventTarget {
     return self._proto;
@@ -103,19 +110,19 @@ pub fn getWindow(self: *Window) *Window {
     return self;
 }
 
-pub fn getTop(self: *Window) *Window {
+pub fn getTop(self: *Window, page: *Page) Access {
     var p = self._page;
     while (p.parent) |parent| {
         p = parent;
     }
-    return p.window;
+    return Access.init(page.window, p.window);
 }
 
-pub fn getParent(self: *Window) *Window {
+pub fn getParent(self: *Window, page: *Page) Access {
     if (self._page.parent) |p| {
-        return p.window;
+        return Access.init(page.window, p.window);
     }
-    return self;
+    return .{ .window = self };
 }
 
 pub fn getDocument(self: *Window) *Document {
@@ -222,6 +229,14 @@ pub fn setOnMessage(self: *Window, setter: ?FunctionSetter) void {
     self._on_message = getFunctionFromSetter(setter);
 }
 
+pub fn getOnRejectionHandled(self: *const Window) ?js.Function.Global {
+    return self._on_rejection_handled;
+}
+
+pub fn setOnRejectionHandled(self: *Window, setter: ?FunctionSetter) void {
+    self._on_rejection_handled = getFunctionFromSetter(setter);
+}
+
 pub fn getOnUnhandledRejection(self: *const Window) ?js.Function.Global {
     return self._on_unhandled_rejection;
 }
@@ -276,23 +291,23 @@ pub fn queueMicrotask(_: *Window, cb: js.Function, page: *Page) void {
 }
 
 pub fn clearTimeout(self: *Window, id: u32) void {
-    var sc = self._timers.get(id) orelse return;
-    sc.removed = true;
+    var sc = self._timers.fetchRemove(id) orelse return;
+    sc.value.removed = true;
 }
 
 pub fn clearInterval(self: *Window, id: u32) void {
-    var sc = self._timers.get(id) orelse return;
-    sc.removed = true;
+    var sc = self._timers.fetchRemove(id) orelse return;
+    sc.value.removed = true;
 }
 
 pub fn clearImmediate(self: *Window, id: u32) void {
-    var sc = self._timers.get(id) orelse return;
-    sc.removed = true;
+    var sc = self._timers.fetchRemove(id) orelse return;
+    sc.value.removed = true;
 }
 
 pub fn cancelAnimationFrame(self: *Window, id: u32) void {
-    var sc = self._timers.get(id) orelse return;
-    sc.removed = true;
+    var sc = self._timers.fetchRemove(id) orelse return;
+    sc.value.removed = true;
 }
 
 const RequestIdleCallbackOpts = struct {
@@ -310,8 +325,8 @@ pub fn requestIdleCallback(self: *Window, cb: js.Function.Temp, opts_: ?RequestI
 }
 
 pub fn cancelIdleCallback(self: *Window, id: u32) void {
-    var sc = self._timers.get(id) orelse return;
-    sc.removed = true;
+    var sc = self._timers.fetchRemove(id) orelse return;
+    sc.value.removed = true;
 }
 
 pub fn reportError(self: *Window, err: js.Value, page: *Page) !void {
@@ -392,7 +407,7 @@ pub fn postMessage(self: *Window, message: js.Value.Temp, target_origin: ?[]cons
     const target_page = self._page;
     const source_window = target_page.js.getIncumbent().window;
 
-    const arena = try target_page.getArena(.{ .debug = "Window.postMessage" });
+    const arena = try target_page.getArena(.medium, "Window.postMessage");
     errdefer target_page.releaseArena(arena);
 
     // Origin should be the source window's origin (where the message came from)
@@ -572,7 +587,7 @@ pub fn scrollBy(self: *Window, opts: ScrollToOpts, y: ?i32, page: *Page) !void {
     return self.scrollTo(.{ .x = absx }, absy, page);
 }
 
-pub fn unhandledPromiseRejection(self: *Window, rejection: js.PromiseRejection, page: *Page) !void {
+pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, rejection: js.PromiseRejection, page: *Page) !void {
     if (comptime IS_DEBUG) {
         log.debug(.js, "unhandled rejection", .{
             .value = rejection.reason(),
@@ -580,15 +595,41 @@ pub fn unhandledPromiseRejection(self: *Window, rejection: js.PromiseRejection, 
         });
     }
 
+    const event_name, const attribute_callback = blk: {
+        if (no_handler) {
+            break :blk .{ "unhandledrejection", self._on_unhandled_rejection };
+        }
+        break :blk .{ "rejectionhandled", self._on_rejection_handled };
+    };
+
     const target = self.asEventTarget();
-    if (page._event_manager.hasDirectListeners(target, "unhandledrejection", self._on_unhandled_rejection)) {
-        const event = (try @import("event/PromiseRejectionEvent.zig").init("unhandledrejection", .{
+    if (page._event_manager.hasDirectListeners(target, event_name, attribute_callback)) {
+        const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
             .reason = if (rejection.reason()) |r| try r.temp() else null,
             .promise = try rejection.promise().temp(),
         }, page)).asEvent();
-        try page._event_manager.dispatchDirect(target, event, self._on_unhandled_rejection, .{ .context = "window.unhandledrejection" });
+        try page._event_manager.dispatchDirect(target, event, attribute_callback, .{ .context = "window.unhandledrejection" });
     }
 }
+
+pub const Access = union(enum) {
+    window: *Window,
+    cross_origin: *CrossOriginWindow,
+
+    pub fn init(callee: *Window, accessing: *Window) Access {
+        if (callee == accessing) {
+            // common enough that it's worth the check
+            return .{ .window = accessing };
+        }
+
+        if (callee._page.js.origin == accessing._page.js.origin) {
+            // two different windows, but same origin, return the full window
+            return .{ .window = accessing };
+        }
+
+        return .{ .cross_origin = &accessing._cross_origin_wrapper };
+    }
+};
 
 const ScheduleOpts = struct {
     repeat: bool,
@@ -604,7 +645,7 @@ fn scheduleCallback(self: *Window, cb: js.Function.Temp, delay_ms: u32, opts: Sc
         return error.TooManyTimeout;
     }
 
-    const arena = try page.getArena(.{ .debug = "Window.schedule" });
+    const arena = try page.getArena(.tiny, "Window.schedule");
     errdefer page.releaseArena(arena);
 
     const timer_id = self._timer_id +% 1;
@@ -688,7 +729,6 @@ const ScheduleCallback = struct {
         const window = page.window;
 
         if (self.removed) {
-            _ = window._timers.remove(self.timer_id);
             self.deinit();
             return null;
         }
@@ -751,7 +791,7 @@ const PostMessageCallback = struct {
         const event_target = window.asEventTarget();
         if (page._event_manager.hasDirectListeners(event_target, "message", window._on_message)) {
             const event = (try MessageEvent.initTrusted(comptime .wrap("message"), .{
-                .data = self.message,
+                .data = .{ .value = self.message },
                 .origin = self.origin,
                 .source = self.source,
                 .bubbles = false,
@@ -789,7 +829,7 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const document = bridge.accessor(Window.getDocument, null, .{ .cache = .{ .internal = 1 } });
+    pub const document = bridge.accessor(Window.getDocument, null, .{ .cache = .{ .internal = 1 }, .deletable = false });
     pub const console = bridge.accessor(Window.getConsole, null, .{ .cache = .{ .internal = 2 } });
 
     pub const top = bridge.accessor(Window.getTop, null, .{});
@@ -802,7 +842,7 @@ pub const JsApi = struct {
     pub const performance = bridge.accessor(Window.getPerformance, null, .{});
     pub const localStorage = bridge.accessor(Window.getLocalStorage, null, .{});
     pub const sessionStorage = bridge.accessor(Window.getSessionStorage, null, .{});
-    pub const location = bridge.accessor(Window.getLocation, Window.setLocation, .{});
+    pub const location = bridge.accessor(Window.getLocation, Window.setLocation, .{ .deletable = false });
     pub const history = bridge.accessor(Window.getHistory, null, .{});
     pub const navigation = bridge.accessor(Window.getNavigation, null, .{});
     pub const crypto = bridge.accessor(Window.getCrypto, null, .{});
@@ -813,6 +853,7 @@ pub const JsApi = struct {
     pub const onpopstate = bridge.accessor(Window.getOnPopState, Window.setOnPopState, .{});
     pub const onerror = bridge.accessor(Window.getOnError, Window.setOnError, .{});
     pub const onmessage = bridge.accessor(Window.getOnMessage, Window.setOnMessage, .{});
+    pub const onrejectionhandled = bridge.accessor(Window.getOnRejectionHandled, Window.setOnRejectionHandled, .{});
     pub const onunhandledrejection = bridge.accessor(Window.getOnUnhandledRejection, Window.setOnUnhandledRejection, .{});
     pub const event = bridge.accessor(Window.getEvent, null, .{ .null_as_undefined = true });
     pub const fetch = bridge.function(Window.fetch, .{});
@@ -862,18 +903,69 @@ pub const JsApi = struct {
     pub const opener = bridge.property(null, .{ .template = false });
 
     pub const alert = bridge.function(struct {
-        fn alert(_: *const Window, _: ?[]const u8) void {}
-    }.alert, .{ .noop = true });
+        fn alert(_: *const Window, message: ?[]const u8, page: *Page) void {
+            page._session.notification.dispatch(.javascript_dialog_opening, &.{
+                .url = page.url,
+                .message = message orelse "",
+                .dialog_type = "alert",
+            });
+        }
+    }.alert, .{});
     pub const confirm = bridge.function(struct {
-        fn confirm(_: *const Window, _: ?[]const u8) bool {
+        fn confirm(_: *const Window, message: ?[]const u8, page: *Page) bool {
+            page._session.notification.dispatch(.javascript_dialog_opening, &.{
+                .url = page.url,
+                .message = message orelse "",
+                .dialog_type = "confirm",
+            });
             return false;
         }
     }.confirm, .{});
     pub const prompt = bridge.function(struct {
-        fn prompt(_: *const Window, _: ?[]const u8, _: ?[]const u8) ?[]const u8 {
+        fn prompt(_: *const Window, message: ?[]const u8, _: ?[]const u8, page: *Page) ?[]const u8 {
+            page._session.notification.dispatch(.javascript_dialog_opening, &.{
+                .url = page.url,
+                .message = message orelse "",
+                .dialog_type = "prompt",
+            });
             return null;
         }
     }.prompt, .{});
+};
+
+const CrossOriginWindow = struct {
+    window: *Window,
+
+    pub fn postMessage(self: *CrossOriginWindow, message: js.Value.Temp, target_origin: ?[]const u8, page: *Page) !void {
+        return self.window.postMessage(message, target_origin, page);
+    }
+
+    pub fn getTop(self: *CrossOriginWindow, page: *Page) Access {
+        return self.window.getParent(page);
+    }
+
+    pub fn getParent(self: *CrossOriginWindow, page: *Page) Access {
+        return self.window.getParent(page);
+    }
+
+    pub fn getFramesLength(self: *const CrossOriginWindow) u32 {
+        return self.window.getFramesLength();
+    }
+
+    pub const JsApi = struct {
+        pub const bridge = js.Bridge(CrossOriginWindow);
+
+        pub const Meta = struct {
+            pub const name = "CrossOriginWindow";
+            pub const prototype_chain = bridge.prototypeChain();
+            pub var class_id: bridge.ClassId = undefined;
+        };
+
+        pub const postMessage = bridge.function(CrossOriginWindow.postMessage, .{});
+        pub const top = bridge.accessor(CrossOriginWindow.getTop, null, .{});
+        pub const parent = bridge.accessor(CrossOriginWindow.getParent, null, .{});
+        pub const length = bridge.accessor(CrossOriginWindow.getFramesLength, null, .{});
+    };
 };
 
 const testing = @import("../../testing.zig");

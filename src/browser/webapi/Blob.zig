@@ -17,7 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const Writer = std.Io.Writer;
+const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
@@ -25,6 +25,7 @@ const Session = @import("../Session.zig");
 
 const Mime = @import("../Mime.zig");
 
+const Writer = std.Io.Writer;
 const Allocator = std.mem.Allocator;
 
 /// https://w3c.github.io/FileAPI/#blob-section
@@ -34,6 +35,7 @@ const Blob = @This();
 pub const _prototype_root = true;
 
 _type: Type,
+_rc: lp.RC(u32),
 
 _arena: Allocator,
 
@@ -75,7 +77,15 @@ pub fn initWithMimeValidation(
     validate_mime: bool,
     page: *Page,
 ) !*Blob {
-    const arena = try page.getArena(.{ .debug = "Blob" });
+    const data_len = blk: {
+        const parts = maybe_blob_parts orelse break :blk 0;
+        var size: usize = 0;
+        for (parts) |p| {
+            size += p.len;
+        }
+        break :blk size;
+    };
+    const arena = try page.getArena(256 + data_len, "Blob");
     errdefer page.releaseArena(arena);
 
     const options: InitOptions = maybe_options orelse .{};
@@ -120,6 +130,7 @@ pub fn initWithMimeValidation(
 
     const self = try arena.create(Blob);
     self.* = .{
+        ._rc = .{},
         ._arena = arena,
         ._type = .generic,
         ._slice = data,
@@ -128,9 +139,16 @@ pub fn initWithMimeValidation(
     return self;
 }
 
-pub fn deinit(self: *Blob, shutdown: bool, session: *Session) void {
-    _ = shutdown;
+pub fn deinit(self: *Blob, session: *Session) void {
     session.releaseArena(self._arena);
+}
+
+pub fn releaseRef(self: *Blob, session: *Session) void {
+    self._rc.release(self, session);
+}
+
+pub fn acquireRef(self: *Blob) void {
+    self._rc.acquire();
 }
 
 const largest_vector = @max(std.simd.suggestVectorLength(u8) orelse 1, 8);
@@ -325,8 +343,6 @@ pub const JsApi = struct {
         pub const name = "Blob";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(Blob.deinit);
     };
 
     pub const constructor = bridge.constructor(Blob.init, .{});

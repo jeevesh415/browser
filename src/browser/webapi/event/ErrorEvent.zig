@@ -47,14 +47,14 @@ pub const ErrorEventOptions = struct {
 const Options = Event.inheritOptions(ErrorEvent, ErrorEventOptions);
 
 pub fn init(typ: []const u8, opts_: ?Options, page: *Page) !*ErrorEvent {
-    const arena = try page.getArena(.{ .debug = "ErrorEvent" });
+    const arena = try page.getArena(.small, "ErrorEvent");
     errdefer page.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
     return initWithTrusted(arena, type_string, opts_, false, page);
 }
 
 pub fn initTrusted(typ: String, opts_: ?Options, page: *Page) !*ErrorEvent {
-    const arena = try page.getArena(.{ .debug = "ErrorEvent.trusted" });
+    const arena = try page.getArena(.small, "ErrorEvent.trusted");
     errdefer page.releaseArena(arena);
     return initWithTrusted(arena, typ, opts_, true, page);
 }
@@ -80,11 +80,19 @@ fn initWithTrusted(arena: Allocator, typ: String, opts_: ?Options, trusted: bool
     return event;
 }
 
-pub fn deinit(self: *ErrorEvent, shutdown: bool, session: *Session) void {
+pub fn deinit(self: *ErrorEvent, session: *Session) void {
     if (self._error) |e| {
         e.release();
     }
-    self._proto.deinit(shutdown, session);
+    self._proto.deinit(session);
+}
+
+pub fn acquireRef(self: *ErrorEvent) void {
+    self._proto.acquireRef();
+}
+
+pub fn releaseRef(self: *ErrorEvent, session: *Session) void {
+    self._proto._rc.release(self, session);
 }
 
 pub fn asEvent(self: *ErrorEvent) *Event {

@@ -18,16 +18,12 @@
 
 const std = @import("std");
 const js = @import("js.zig");
-const lp = @import("lightpanda");
-const log = @import("../../log.zig");
 const Page = @import("../Page.zig");
 const Session = @import("../Session.zig");
 
 const v8 = js.v8;
 
 const Caller = @import("Caller.zig");
-const Context = @import("Context.zig");
-const Origin = @import("Origin.zig");
 
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
@@ -105,34 +101,6 @@ pub fn Builder(comptime T: type) type {
             }
             return entries;
         }
-
-        pub fn finalizer(comptime func: *const fn (self: *T, shutdown: bool, session: *Session) void) Finalizer {
-            return .{
-                .from_zig = struct {
-                    fn wrap(ptr: *anyopaque, session: *Session) void {
-                        func(@ptrCast(@alignCast(ptr)), true, session);
-                    }
-                }.wrap,
-
-                .from_v8 = struct {
-                    fn wrap(handle: ?*const v8.WeakCallbackInfo) callconv(.c) void {
-                        const ptr = v8.v8__WeakCallbackInfo__GetParameter(handle.?).?;
-                        const fc: *Origin.FinalizerCallback = @ptrCast(@alignCast(ptr));
-
-                        const origin = fc.origin;
-                        const value_ptr = fc.ptr;
-                        if (origin.finalizer_callbacks.contains(@intFromPtr(value_ptr))) {
-                            func(@ptrCast(@alignCast(value_ptr)), false, fc.session);
-                            origin.release(value_ptr);
-                        } else {
-                            // A bit weird, but v8 _requires_ that we release it
-                            // If we don't. We'll 100% crash.
-                            v8.v8__Global__Reset(&fc.global);
-                        }
-                    }
-                }.wrap,
-            };
-        }
     };
 }
 
@@ -148,7 +116,9 @@ pub const Constructor = struct {
             fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
                 const v8_isolate = v8.v8__FunctionCallbackInfo__GetIsolate(handle).?;
                 var caller: Caller = undefined;
-                caller.init(v8_isolate);
+                if (!caller.init(v8_isolate)) {
+                    return;
+                }
                 defer caller.deinit();
 
                 caller.constructor(T, func, handle.?, .{
@@ -200,6 +170,7 @@ pub const Function = struct {
 
 pub const Accessor = struct {
     static: bool = false,
+    deletable: bool = true,
     cache: ?Caller.Function.Opts.Caching = null,
     getter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
     setter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
@@ -208,6 +179,7 @@ pub const Accessor = struct {
         var accessor = Accessor{
             .cache = opts.cache,
             .static = opts.static,
+            .deletable = opts.deletable,
         };
 
         if (@typeInfo(@TypeOf(getter)) != .null) {
@@ -246,7 +218,9 @@ pub const Indexed = struct {
                 fn wrap(idx: u32, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                     const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                     var caller: Caller = undefined;
-                    caller.init(v8_isolate);
+                    if (!caller.init(v8_isolate)) {
+                        return 0;
+                    }
                     defer caller.deinit();
 
                     return caller.getIndex(T, getter, idx, handle.?, .{
@@ -262,7 +236,9 @@ pub const Indexed = struct {
                 fn wrap(handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                     const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                     var caller: Caller = undefined;
-                    caller.init(v8_isolate);
+                    if (!caller.init(v8_isolate)) {
+                        return 0;
+                    }
                     defer caller.deinit();
                     return caller.getEnumerator(T, enumerator, handle.?, .{});
                 }
@@ -288,7 +264,9 @@ pub const NamedIndexed = struct {
             fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                 const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                 var caller: Caller = undefined;
-                caller.init(v8_isolate);
+                if (!caller.init(v8_isolate)) {
+                    return 0;
+                }
                 defer caller.deinit();
 
                 return caller.getNamedIndex(T, getter, c_name.?, handle.?, .{
@@ -302,7 +280,9 @@ pub const NamedIndexed = struct {
             fn wrap(c_name: ?*const v8.Name, c_value: ?*const v8.Value, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                 const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                 var caller: Caller = undefined;
-                caller.init(v8_isolate);
+                if (!caller.init(v8_isolate)) {
+                    return 0;
+                }
                 defer caller.deinit();
 
                 return caller.setNamedIndex(T, setter, c_name.?, c_value.?, handle.?, .{
@@ -316,7 +296,9 @@ pub const NamedIndexed = struct {
             fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
                 const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
                 var caller: Caller = undefined;
-                caller.init(v8_isolate);
+                if (!caller.init(v8_isolate)) {
+                    return 0;
+                }
                 defer caller.deinit();
 
                 return caller.deleteNamedIndex(T, deleter, c_name.?, handle.?, .{
@@ -414,21 +396,12 @@ pub const Property = struct {
     }
 };
 
-const Finalizer = struct {
-    // The finalizer wrapper when called from Zig. This is only called on
-    // Origin.deinit
-    from_zig: *const fn (ctx: *anyopaque, session: *Session) void,
-
-    // The finalizer wrapper when called from V8. This may never be called
-    // (hence why we fallback to calling in Origin.deinit). If it is called,
-    // it is only ever called after we SetWeak on the Global.
-    from_v8: *const fn (?*const v8.WeakCallbackInfo) callconv(.c) void,
-};
-
 pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u8 {
     const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
     var caller: Caller = undefined;
-    caller.init(v8_isolate);
+    if (!caller.init(v8_isolate)) {
+        return 0;
+    }
     defer caller.deinit();
 
     const local = &caller.local;
@@ -506,7 +479,9 @@ pub fn unknownObjectPropertyCallback(comptime JsApi: type) *const fn (?*const v8
             const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
 
             var caller: Caller = undefined;
-            caller.init(v8_isolate);
+            if (!caller.init(v8_isolate)) {
+                return 0;
+            }
             defer caller.deinit();
 
             const local = &caller.local;
@@ -852,6 +827,8 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/event/TextEvent.zig"),
     @import("../webapi/event/InputEvent.zig"),
     @import("../webapi/event/PromiseRejectionEvent.zig"),
+    @import("../webapi/event/SubmitEvent.zig"),
+    @import("../webapi/event/FormDataEvent.zig"),
     @import("../webapi/MessageChannel.zig"),
     @import("../webapi/MessagePort.zig"),
     @import("../webapi/media/MediaError.zig"),
@@ -868,6 +845,8 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/net/URLSearchParams.zig"),
     @import("../webapi/net/XMLHttpRequest.zig"),
     @import("../webapi/net/XMLHttpRequestEventTarget.zig"),
+    @import("../webapi/net/WebSocket.zig"),
+    @import("../webapi/event/CloseEvent.zig"),
     @import("../webapi/streams/ReadableStream.zig"),
     @import("../webapi/streams/ReadableStreamDefaultReader.zig"),
     @import("../webapi/streams/ReadableStreamDefaultController.zig"),
@@ -901,6 +880,7 @@ pub const JsApis = flattenTypes(&.{
     @import("../webapi/canvas/OffscreenCanvas.zig"),
     @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
     @import("../webapi/SubtleCrypto.zig"),
+    @import("../webapi/CryptoKey.zig"),
     @import("../webapi/Selection.zig"),
     @import("../webapi/ImageData.zig"),
 });

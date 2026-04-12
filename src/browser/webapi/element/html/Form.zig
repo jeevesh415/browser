@@ -73,18 +73,22 @@ pub fn setMethod(self: *Form, method: []const u8, page: *Page) !void {
 }
 
 pub fn getElements(self: *Form, page: *Page) !*collections.HTMLFormControlsCollection {
+    const node_live = self.iterator(page);
+    const html_collection = try node_live.runtimeGenericWrap(page);
+
+    return page._factory.create(collections.HTMLFormControlsCollection{
+        ._proto = html_collection,
+    });
+}
+
+pub fn iterator(self: *Form, page: *Page) collections.NodeLive(.form) {
     const form_id = self.asElement().getAttributeSafe(comptime .wrap("id"));
     const root = if (form_id != null)
         self.asNode().getRootNode(null) // Has ID: walk entire document to find form=ID controls
     else
         self.asNode(); // No ID: walk only form subtree (no external controls possible)
 
-    const node_live = collections.NodeLive(.form).init(root, self, page);
-    const html_collection = try node_live.runtimeGenericWrap(page);
-
-    return page._factory.create(collections.HTMLFormControlsCollection{
-        ._proto = html_collection,
-    });
+    return collections.NodeLive(.form).init(root, .{ .form = self, .form_id = form_id }, page);
 }
 
 pub fn getAction(self: *Form, page: *Page) ![]const u8 {
@@ -93,7 +97,7 @@ pub fn getAction(self: *Form, page: *Page) ![]const u8 {
     if (action.len == 0) {
         return page.url;
     }
-    return URL.resolve(page.call_arena, page.base(), action, .{ .encode = true });
+    return element.asNode().resolveURL(action, page, .{});
 }
 
 pub fn setAction(self: *Form, value: []const u8, page: *Page) !void {

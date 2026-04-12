@@ -74,6 +74,8 @@ const EventListeners = struct {
     page_network_idle: List = .{},
     page_network_almost_idle: List = .{},
     page_frame_created: List = .{},
+    page_dom_content_loaded: List = .{},
+    page_loaded: List = .{},
     http_request_fail: List = .{},
     http_request_start: List = .{},
     http_request_intercept: List = .{},
@@ -81,6 +83,7 @@ const EventListeners = struct {
     http_request_auth_required: List = .{},
     http_response_data: List = .{},
     http_response_header_done: List = .{},
+    javascript_dialog_opening: List = .{},
 };
 
 const Events = union(enum) {
@@ -91,6 +94,8 @@ const Events = union(enum) {
     page_network_idle: *const PageNetworkIdle,
     page_network_almost_idle: *const PageNetworkAlmostIdle,
     page_frame_created: *const PageFrameCreated,
+    page_dom_content_loaded: *const PageDOMContentLoaded,
+    page_loaded: *const PageLoaded,
     http_request_fail: *const RequestFail,
     http_request_start: *const RequestStart,
     http_request_intercept: *const RequestIntercept,
@@ -98,6 +103,7 @@ const Events = union(enum) {
     http_request_done: *const RequestDone,
     http_response_data: *const ResponseData,
     http_response_header_done: *const ResponseHeaderDone,
+    javascript_dialog_opening: *const JavascriptDialogOpening,
 };
 const EventType = std.meta.FieldEnum(Events);
 
@@ -137,6 +143,18 @@ pub const PageFrameCreated = struct {
     timestamp: u64,
 };
 
+pub const PageDOMContentLoaded = struct {
+    req_id: u32,
+    frame_id: u32,
+    timestamp: u64,
+};
+
+pub const PageLoaded = struct {
+    req_id: u32,
+    frame_id: u32,
+    timestamp: u64,
+};
+
 pub const RequestStart = struct {
     transfer: *Transfer,
 };
@@ -167,6 +185,12 @@ pub const RequestDone = struct {
 pub const RequestFail = struct {
     transfer: *Transfer,
     err: anyerror,
+};
+
+pub const JavascriptDialogOpening = struct {
+    url: [:0]const u8,
+    message: []const u8,
+    dialog_type: []const u8,
 };
 
 pub fn init(allocator: Allocator) !*Notification {

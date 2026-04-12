@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const log = @import("../log.zig");
 const builtin = @import("builtin");
 const net = std.net;
 const posix = std.posix;
@@ -26,11 +27,16 @@ const lp = @import("lightpanda");
 const Config = @import("../Config.zig");
 const libcurl = @import("../sys/libcurl.zig");
 
-const net_http = @import("http.zig");
+const http = @import("http.zig");
+const IpFilter = @import("IpFilter.zig");
 const RobotStore = @import("Robots.zig").RobotStore;
 const WebBotAuth = @import("WebBotAuth.zig");
 
-const Runtime = @This();
+const Cache = @import("cache/Cache.zig");
+const FsCache = @import("cache/FsCache.zig");
+
+const App = @import("../App.zig");
+const Network = @This();
 
 const Listener = struct {
     socket: posix.socket_t,
@@ -45,14 +51,21 @@ const MAX_TICK_CALLBACKS = 16;
 
 allocator: Allocator,
 
+app: *App,
 config: *const Config,
-ca_blob: ?net_http.Blob,
+ca_blob: ?http.Blob,
 robot_store: RobotStore,
 web_bot_auth: ?WebBotAuth,
+cache: ?Cache,
 
-connections: []net_http.Connection,
+connections: []http.Connection,
 available: std.DoublyLinkedList = .{},
 conn_mutex: std.Thread.Mutex = .{},
+
+ws_pool: std.heap.MemoryPool(http.Connection),
+ws_count: usize = 0,
+ws_max: u8,
+ws_mutex: std.Thread.Mutex = .{},
 
 pollfds: []posix.pollfd,
 listener: ?Listener = null,
@@ -63,8 +76,8 @@ wakeup_pipe: [2]posix.fd_t = .{ -1, -1 },
 shutdown: std.atomic.Value(bool) = .init(false),
 
 // Multi is a heavy structure that can consume up to 2MB of RAM.
-// Currently, Runtime is used sparingly, and we only create it on demand.
-// When Runtime becomes truly shared, it should become a regular field.
+// Currently, Network is used sparingly, and we only create it on demand.
+// When Network becomes truly shared, it should become a regular field.
 multi: ?*libcurl.CurlM = null,
 submission_mutex: std.Thread.Mutex = .{},
 submission_queue: std.DoublyLinkedList = .{},
@@ -72,6 +85,9 @@ submission_queue: std.DoublyLinkedList = .{},
 callbacks: [MAX_TICK_CALLBACKS]TickCallback = undefined,
 callbacks_len: usize = 0,
 callbacks_mutex: std.Thread.Mutex = .{},
+
+/// Optional IP filter for blocking requests to private/internal networks (--block-private-networks).
+ip_filter: ?*IpFilter = null,
 
 const TickCallback = struct {
     ctx: *anyopaque,
@@ -200,7 +216,7 @@ fn globalDeinit() void {
     libcurl.curl_global_cleanup();
 }
 
-pub fn init(allocator: Allocator, config: *const Config) !Runtime {
+pub fn init(allocator: Allocator, app: *App, config: *const Config) !Network {
     globalInit(allocator);
     errdefer globalDeinit();
 
@@ -213,23 +229,57 @@ pub fn init(allocator: Allocator, config: *const Config) !Runtime {
     @memset(pollfds, .{ .fd = -1, .events = 0, .revents = 0 });
     pollfds[0] = .{ .fd = pipe[0], .events = posix.POLL.IN, .revents = 0 };
 
-    var ca_blob: ?net_http.Blob = null;
+    var ca_blob: ?http.Blob = null;
     if (config.tlsVerifyHost()) {
         ca_blob = try loadCerts(allocator);
     }
 
+    // IP filter for blocking requests to private/internal networks.
+    const block_private = config.blockPrivateNetworks();
+    const cidrs: ?IpFilter.Cidrs = blk: {
+        const s = config.blockCidrs() orelse break :blk null;
+        break :blk try IpFilter.parseCidrList(allocator, s);
+    };
+    const has_cidrs = if (cidrs) |c| c.v4.len > 0 or c.v6.len > 0 or c.allow_v4.len > 0 or c.allow_v6.len > 0 else false;
+    const ip_filter: ?*IpFilter = blk: {
+        if (!block_private and !has_cidrs) break :blk null;
+        const f = try allocator.create(IpFilter);
+        f.* = IpFilter.init(block_private, cidrs);
+        break :blk f;
+    };
+    errdefer if (ip_filter) |f| {
+        f.deinit(allocator);
+        allocator.destroy(f);
+    };
+
     const count: usize = config.httpMaxConcurrent();
-    const connections = try allocator.alloc(net_http.Connection, count);
+    const connections = try allocator.alloc(http.Connection, count);
     errdefer allocator.free(connections);
 
     var available: std.DoublyLinkedList = .{};
     for (0..count) |i| {
-        connections[i] = try net_http.Connection.init(ca_blob, config);
+        connections[i] = try http.Connection.init(ca_blob, config, ip_filter);
         available.append(&connections[i].node);
     }
 
     const web_bot_auth = if (config.webBotAuth()) |wba_cfg|
         try WebBotAuth.fromConfig(allocator, &wba_cfg)
+    else
+        null;
+
+    const cache = if (config.httpCacheDir()) |cache_dir_path|
+        Cache{
+            .kind = .{
+                .fs = FsCache.init(cache_dir_path) catch |e| {
+                    log.err(.cache, "failed to init", .{
+                        .kind = "FsCache",
+                        .path = cache_dir_path,
+                        .err = e,
+                    });
+                    return e;
+                },
+            },
+        }
     else
         null;
 
@@ -244,12 +294,20 @@ pub fn init(allocator: Allocator, config: *const Config) !Runtime {
         .available = available,
         .connections = connections,
 
+        .app = app,
+
         .robot_store = RobotStore.init(allocator),
         .web_bot_auth = web_bot_auth,
+        .cache = cache,
+
+        .ws_pool = .init(allocator),
+        .ws_max = config.wsMaxConcurrent(),
+
+        .ip_filter = ip_filter,
     };
 }
 
-pub fn deinit(self: *Runtime) void {
+pub fn deinit(self: *Network) void {
     if (self.multi) |multi| {
         libcurl.curl_multi_cleanup(multi) catch {};
     }
@@ -273,16 +331,25 @@ pub fn deinit(self: *Runtime) void {
     }
     self.allocator.free(self.connections);
 
+    self.ws_pool.deinit();
+
     self.robot_store.deinit();
     if (self.web_bot_auth) |wba| {
         wba.deinit(self.allocator);
+    }
+
+    if (self.cache) |*cache| cache.deinit();
+
+    if (self.ip_filter) |f| {
+        f.deinit(self.allocator);
+        self.allocator.destroy(f);
     }
 
     globalDeinit();
 }
 
 pub fn bind(
-    self: *Runtime,
+    self: *Network,
     address: net.Address,
     ctx: *anyopaque,
     on_accept: *const fn (ctx: *anyopaque, socket: posix.socket_t) void,
@@ -313,7 +380,7 @@ pub fn bind(
     };
 }
 
-pub fn onTick(self: *Runtime, ctx: *anyopaque, callback: *const fn (*anyopaque) void) void {
+pub fn onTick(self: *Network, ctx: *anyopaque, callback: *const fn (*anyopaque) void) void {
     self.callbacks_mutex.lock();
     defer self.callbacks_mutex.unlock();
 
@@ -328,7 +395,7 @@ pub fn onTick(self: *Runtime, ctx: *anyopaque, callback: *const fn (*anyopaque) 
     self.wakeupPoll();
 }
 
-pub fn fireTicks(self: *Runtime) void {
+pub fn fireTicks(self: *Network) void {
     self.callbacks_mutex.lock();
     defer self.callbacks_mutex.unlock();
 
@@ -337,7 +404,7 @@ pub fn fireTicks(self: *Runtime) void {
     }
 }
 
-pub fn run(self: *Runtime) void {
+pub fn run(self: *Network) void {
     var drain_buf: [64]u8 = undefined;
     var running_handles: c_int = 0;
 
@@ -428,18 +495,18 @@ pub fn run(self: *Runtime) void {
     }
 }
 
-pub fn submitRequest(self: *Runtime, conn: *net_http.Connection) void {
+pub fn submitRequest(self: *Network, conn: *http.Connection) void {
     self.submission_mutex.lock();
     self.submission_queue.append(&conn.node);
     self.submission_mutex.unlock();
     self.wakeupPoll();
 }
 
-fn wakeupPoll(self: *Runtime) void {
+fn wakeupPoll(self: *Network) void {
     _ = posix.write(self.wakeup_pipe[1], &.{1}) catch {};
 }
 
-fn drainQueue(self: *Runtime) void {
+fn drainQueue(self: *Network) void {
     self.submission_mutex.lock();
     defer self.submission_mutex.unlock();
 
@@ -455,25 +522,25 @@ fn drainQueue(self: *Runtime) void {
     };
 
     while (self.submission_queue.popFirst()) |node| {
-        const conn: *net_http.Connection = @fieldParentPtr("node", node);
+        const conn: *http.Connection = @fieldParentPtr("node", node);
         conn.setPrivate(conn) catch |err| {
             lp.log.err(.app, "curl set private", .{ .err = err });
             self.releaseConnection(conn);
             continue;
         };
-        libcurl.curl_multi_add_handle(multi, conn.easy) catch |err| {
+        libcurl.curl_multi_add_handle(multi, conn._easy) catch |err| {
             lp.log.err(.app, "curl multi add", .{ .err = err });
             self.releaseConnection(conn);
         };
     }
 }
 
-pub fn stop(self: *Runtime) void {
+pub fn stop(self: *Network) void {
     self.shutdown.store(true, .release);
     self.wakeupPoll();
 }
 
-fn acceptConnections(self: *Runtime) void {
+fn acceptConnections(self: *Network) void {
     if (self.shutdown.load(.acquire)) {
         return;
     }
@@ -503,7 +570,7 @@ fn acceptConnections(self: *Runtime) void {
     }
 }
 
-fn preparePollFds(self: *Runtime, multi: *libcurl.CurlM) void {
+fn preparePollFds(self: *Network, multi: *libcurl.CurlM) void {
     const curl_fds = self.pollfds[PSEUDO_POLLFDS..];
     @memset(curl_fds, .{ .fd = -1, .events = 0, .revents = 0 });
 
@@ -514,14 +581,14 @@ fn preparePollFds(self: *Runtime, multi: *libcurl.CurlM) void {
     };
 }
 
-fn getCurlTimeout(self: *Runtime) i32 {
+fn getCurlTimeout(self: *Network) i32 {
     const multi = self.multi orelse return -1;
     var timeout_ms: c_long = -1;
     libcurl.curl_multi_timeout(multi, &timeout_ms) catch return -1;
     return @intCast(@min(timeout_ms, std.math.maxInt(i32)));
 }
 
-fn processCompletions(self: *Runtime, multi: *libcurl.CurlM) void {
+fn processCompletions(self: *Network, multi: *libcurl.CurlM) void {
     var msgs_in_queue: c_int = 0;
     while (libcurl.curl_multi_info_read(multi, &msgs_in_queue)) |msg| {
         switch (msg.data) {
@@ -537,7 +604,7 @@ fn processCompletions(self: *Runtime, multi: *libcurl.CurlM) void {
         var ptr: *anyopaque = undefined;
         libcurl.curl_easy_getinfo(easy, .private, &ptr) catch
             lp.assert(false, "curl getinfo private", .{});
-        const conn: *net_http.Connection = @ptrCast(@alignCast(ptr));
+        const conn: *http.Connection = @ptrCast(@alignCast(ptr));
 
         libcurl.curl_multi_remove_handle(multi, easy) catch {};
         self.releaseConnection(conn);
@@ -556,7 +623,7 @@ comptime {
     }
 }
 
-pub fn getConnection(self: *Runtime) ?*net_http.Connection {
+pub fn getConnection(self: *Network) ?*http.Connection {
     self.conn_mutex.lock();
     defer self.conn_mutex.unlock();
 
@@ -564,19 +631,51 @@ pub fn getConnection(self: *Runtime) ?*net_http.Connection {
     return @fieldParentPtr("node", node);
 }
 
-pub fn releaseConnection(self: *Runtime, conn: *net_http.Connection) void {
-    conn.reset() catch |err| {
-        lp.assert(false, "couldn't reset curl easy", .{ .err = err });
-    };
-
-    self.conn_mutex.lock();
-    defer self.conn_mutex.unlock();
-
-    self.available.append(&conn.node);
+pub fn releaseConnection(self: *Network, conn: *http.Connection) void {
+    switch (conn.transport) {
+        .websocket => {
+            conn.deinit();
+            self.ws_mutex.lock();
+            defer self.ws_mutex.unlock();
+            self.ws_pool.destroy(conn);
+            self.ws_count -= 1;
+        },
+        else => {
+            conn.reset(self.config, self.ca_blob, self.ip_filter) catch |err| {
+                lp.assert(false, "couldn't reset curl easy", .{ .err = err });
+            };
+            self.conn_mutex.lock();
+            defer self.conn_mutex.unlock();
+            self.available.append(&conn.node);
+        },
+    }
 }
 
-pub fn newConnection(self: *Runtime) !net_http.Connection {
-    return net_http.Connection.init(self.ca_blob, self.config);
+pub fn newConnection(self: *Network) ?*http.Connection {
+    const conn = blk: {
+        self.ws_mutex.lock();
+        defer self.ws_mutex.unlock();
+
+        if (self.ws_count >= self.ws_max) {
+            return null;
+        }
+
+        const c = self.ws_pool.create() catch return null;
+        self.ws_count += 1;
+        break :blk c;
+    };
+
+    // don't do this under lock
+    conn.* = http.Connection.init(self.ca_blob, self.config, self.ip_filter) catch {
+        self.ws_mutex.lock();
+        defer self.ws_mutex.unlock();
+        self.ws_pool.destroy(conn);
+        self.ws_count -= 1;
+
+        return null;
+    };
+
+    return conn;
 }
 
 // Wraps lines @ 64 columns. A PEM is basically a base64 encoded DER (which is

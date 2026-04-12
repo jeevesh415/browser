@@ -410,24 +410,50 @@ fn runWebApiTest(test_file: [:0]const u8) !void {
     page.js.localScope(&ls);
     defer ls.deinit();
 
-    var try_catch: js.TryCatch = undefined;
-    try_catch.init(&ls.local);
-    defer try_catch.deinit();
+    {
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(&ls.local);
+        defer try_catch.deinit();
 
-    try page.navigate(url, .{});
-    _ = test_session.wait(2000);
+        try page.navigate(url, .{});
+    }
 
-    test_browser.runMicrotasks();
+    var runner = try test_session.runner(.{});
+    try runner.wait(.{ .ms = 2000 });
 
-    ls.local.eval("testing.assertOk()", "testing.assertOk()") catch |err| {
-        const caught = try_catch.caughtOrError(arena_allocator, err);
-        std.debug.print("{s}: test failure\nError: {f}\n", .{ test_file, caught });
-        return err;
-    };
+    var wait_ms: u32 = 2000;
+    var timer = try std.time.Timer.start();
+    while (true) {
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(&ls.local);
+        defer try_catch.deinit();
+
+        const js_val = ls.local.exec("testing.assertOk()", "testing.assertOk()") catch |err| {
+            const caught = try_catch.caughtOrError(arena_allocator, err);
+            std.debug.print("{s}: test failure\nError: {f}\n", .{ test_file, caught });
+            return err;
+        };
+        if (js_val.isTrue()) {
+            return;
+        }
+        const sleep_ms: usize = switch (try runner.tick(.{ .ms = 20 })) {
+            .done => 20,
+            .ok => |next_ms| @min(next_ms, 20),
+        };
+
+        const ms_elapsed = timer.lap() / 1_000_000;
+        if (ms_elapsed >= wait_ms) {
+            return error.TestTimedOut;
+        }
+        wait_ms -= @intCast(ms_elapsed);
+        std.Thread.sleep(std.time.ns_per_ms * sleep_ms);
+    }
 }
 
-// Used by a few CDP tests - wouldn't be sad to see this go.
-pub fn pageTest(comptime test_file: []const u8) !*Page {
+const PageTestOpts = struct {
+    wait_until_done: bool = true,
+};
+pub fn pageTest(comptime test_file: []const u8, opts: PageTestOpts) !*Page {
     const page = try test_session.createPage();
     errdefer test_session.removePage();
 
@@ -439,22 +465,24 @@ pub fn pageTest(comptime test_file: []const u8) !*Page {
     );
 
     try page.navigate(url, .{});
-    _ = test_session.wait(2000);
+    var runner = try test_session.runner(.{});
+    if (opts.wait_until_done) {
+        try runner.wait(.{ .ms = 2000 });
+    }
     return page;
-}
-
-test {
-    std.testing.refAllDecls(@This());
 }
 
 const log = @import("log.zig");
 const TestHTTPServer = @import("TestHTTPServer.zig");
+const TestWSServer = @import("TestWSServer.zig");
 
 const Server = @import("Server.zig");
 var test_cdp_server: ?*Server = null;
 var test_cdp_server_thread: ?std.Thread = null;
 var test_http_server: ?TestHTTPServer = null;
 var test_http_server_thread: ?std.Thread = null;
+var test_ws_server: ?TestWSServer = null;
+var test_ws_server_thread: ?std.Thread = null;
 
 var test_config: Config = undefined;
 
@@ -468,6 +496,7 @@ test "tests:beforeAll" {
         .common = .{
             .tls_verify_host = false,
             .user_agent_suffix = "internal-tester",
+            .ws_max_concurrent = 50,
         },
     } });
 
@@ -487,12 +516,15 @@ test "tests:beforeAll" {
     test_session = try test_browser.newSession(test_notification);
 
     var wg: std.Thread.WaitGroup = .{};
-    wg.startMany(2);
+    wg.startMany(3);
 
     test_cdp_server_thread = try std.Thread.spawn(.{}, serveCDP, .{&wg});
 
     test_http_server = TestHTTPServer.init(testHTTPHandler);
     test_http_server_thread = try std.Thread.spawn(.{}, TestHTTPServer.run, .{ &test_http_server.?, &wg });
+
+    test_ws_server = TestWSServer.init();
+    test_ws_server_thread = try std.Thread.spawn(.{}, TestWSServer.run, .{ &test_ws_server.?, &wg });
 
     // need to wait for the servers to be listening, else tests will fail because
     // they aren't able to connect.
@@ -516,6 +548,13 @@ test "tests:afterAll" {
     }
     if (test_http_server) |*server| {
         server.deinit();
+    }
+
+    if (test_ws_server) |*server| {
+        server.stop();
+    }
+    if (test_ws_server_thread) |thread| {
+        thread.join();
     }
 
     @import("root").v8_peak_memory = test_browser.env.isolate.getHeapStatistics().total_physical_size;

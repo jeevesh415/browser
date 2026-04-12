@@ -17,7 +17,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 const std = @import("std");
 
-const log = @import("../../../../log.zig");
 const js = @import("../../../js/js.zig");
 const Page = @import("../../../Page.zig");
 
@@ -46,9 +45,9 @@ pub fn asNode(self: *Script) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getSrc(self: *const Script, page: *Page) ![]const u8 {
+pub fn getSrc(self: *Script, page: *Page) ![]const u8 {
     if (self._src.len == 0) return "";
-    return try URL.resolve(page.call_arena, page.base(), self._src, .{ .encode = true });
+    return self.asNode().resolveURL(self._src, page, .{});
 }
 
 pub fn setSrc(self: *Script, src: []const u8, page: *Page) !void {

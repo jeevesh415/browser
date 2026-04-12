@@ -16,6 +16,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../js/js.zig");
 const log = @import("../../log.zig");
 
@@ -25,6 +27,8 @@ const Allocator = std.mem.Allocator;
 
 const Page = @import("../Page.zig");
 const Session = @import("../Session.zig");
+
+const Node = @import("Node.zig");
 const Element = @import("Element.zig");
 const DOMRect = @import("DOMRect.zig");
 
@@ -37,6 +41,7 @@ pub fn registerTypes() []const type {
 
 const IntersectionObserver = @This();
 
+_rc: lp.RC(u8) = .{},
 _arena: Allocator,
 _callback: js.Function.Temp,
 _observing: std.ArrayList(*Element) = .{},
@@ -55,7 +60,7 @@ var zero_rect: DOMRect = .{
 };
 
 pub const ObserverInit = struct {
-    root: ?*Element = null,
+    root: ?*Node = null,
     rootMargin: ?[]const u8 = null,
     threshold: Threshold = .{ .scalar = 0.0 },
 
@@ -66,7 +71,7 @@ pub const ObserverInit = struct {
 };
 
 pub fn init(callback: js.Function.Temp, options: ?ObserverInit, page: *Page) !*IntersectionObserver {
-    const arena = try page.getArena(.{ .debug = "IntersectionObserver" });
+    const arena = try page.getArena(.medium, "IntersectionObserver");
     errdefer page.releaseArena(arena);
 
     const opts = options orelse ObserverInit{};
@@ -81,24 +86,47 @@ pub fn init(callback: js.Function.Temp, options: ?ObserverInit, page: *Page) !*I
         .array => |arr| try arena.dupe(f64, arr),
     };
 
+    const root: ?*Element = blk: {
+        const root_opt = opts.root orelse break :blk null;
+        switch (root_opt._type) {
+            .element => |el| break :blk el,
+            .document => {
+                // not strictly correct, `null` means the viewport, not the
+                // entire document, but since we don't render anything, this
+                // should be fine.
+                break :blk null;
+            },
+            else => return error.TypeError,
+        }
+    };
+
     const self = try arena.create(IntersectionObserver);
     self.* = .{
         ._arena = arena,
         ._callback = callback,
-        ._root = opts.root,
+        ._root = root,
         ._root_margin = root_margin,
         ._threshold = threshold,
     };
     return self;
 }
 
-pub fn deinit(self: *IntersectionObserver, shutdown: bool, session: *Session) void {
-    if (shutdown) {
-        self._callback.release();
-        session.releaseArena(self._arena);
-    } else if (comptime IS_DEBUG) {
-        std.debug.assert(false);
+pub fn deinit(self: *IntersectionObserver, session: *Session) void {
+    self._callback.release();
+    for (self._pending_entries.items) |entry| {
+        // These were never handed to v8, they do not have a corresponding
+        // FinalizerCallback. We 100% own them.
+        entry.deinit(session);
     }
+    session.releaseArena(self._arena);
+}
+
+pub fn releaseRef(self: *IntersectionObserver, session: *Session) void {
+    self._rc.release(self, session);
+}
+
+pub fn acquireRef(self: *IntersectionObserver) void {
+    self._rc.acquire();
 }
 
 pub fn observe(self: *IntersectionObserver, target: *Element, page: *Page) !void {
@@ -109,12 +137,10 @@ pub fn observe(self: *IntersectionObserver, target: *Element, page: *Page) !void
         }
     }
 
-    // Register with page if this is our first observation
-    if (self._observing.items.len == 0) {
+    try self._observing.append(self._arena, target);
+    if (self._observing.items.len == 1) {
         try page.registerIntersectionObserver(self);
     }
-
-    try self._observing.append(self._arena, target);
 
     // Don't initialize previous state yet - let checkIntersection do it
     // This ensures we get an entry on first observation
@@ -127,17 +153,19 @@ pub fn observe(self: *IntersectionObserver, target: *Element, page: *Page) !void
 }
 
 pub fn unobserve(self: *IntersectionObserver, target: *Element, page: *Page) void {
+    const original_length = self._observing.items.len;
     for (self._observing.items, 0..) |elem, i| {
         if (elem == target) {
             _ = self._observing.swapRemove(i);
             _ = self._previous_states.remove(target);
 
-            // Remove any pending entries for this target
+            // Remove any pending entries for this target.
+            // Entries will be cleaned up by V8 GC via the finalizer.
             var j: usize = 0;
             while (j < self._pending_entries.items.len) {
                 if (self._pending_entries.items[j]._target == target) {
                     const entry = self._pending_entries.swapRemove(j);
-                    entry.deinit(false, page._session);
+                    entry.deinit(page._session);
                 } else {
                     j += 1;
                 }
@@ -145,18 +173,23 @@ pub fn unobserve(self: *IntersectionObserver, target: *Element, page: *Page) voi
             break;
         }
     }
+
+    if (original_length > 0 and self._observing.items.len == 0) {
+        page.unregisterIntersectionObserver(self);
+    }
 }
 
 pub fn disconnect(self: *IntersectionObserver, page: *Page) void {
-    self._previous_states.clearRetainingCapacity();
-
     for (self._pending_entries.items) |entry| {
-        entry.deinit(false, page._session);
+        entry.deinit(page._session);
     }
     self._pending_entries.clearRetainingCapacity();
+    self._previous_states.clearRetainingCapacity();
 
+    if (self._observing.items.len > 0) {
+        page.unregisterIntersectionObserver(self);
+    }
     self._observing.clearRetainingCapacity();
-    page.unregisterIntersectionObserver(self);
 }
 
 pub fn takeRecords(self: *IntersectionObserver, page: *Page) ![]*IntersectionObserverEntry {
@@ -233,7 +266,7 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, page: *Page)
         (was_intersecting_opt != null and was_intersecting_opt.? != is_now_intersecting);
 
     if (should_report) {
-        const arena = try page.getArena(.{ .debug = "IntersectionObserverEntry" });
+        const arena = try page.getArena(.tiny, "IntersectionObserverEntry");
         errdefer page.releaseArena(arena);
 
         const entry = try arena.create(IntersectionObserverEntry);
@@ -247,7 +280,6 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, page: *Page)
             ._bounding_client_rect = try page._factory.create(data.bounding_client_rect),
             ._intersection_ratio = data.intersection_ratio,
         };
-
         try self._pending_entries.append(self._arena, entry);
     }
 
@@ -289,6 +321,7 @@ pub fn deliverEntries(self: *IntersectionObserver, page: *Page) !void {
 }
 
 pub const IntersectionObserverEntry = struct {
+    _rc: lp.RC(u8) = .{},
     _arena: Allocator,
     _time: f64,
     _target: *Element,
@@ -298,8 +331,16 @@ pub const IntersectionObserverEntry = struct {
     _intersection_ratio: f64,
     _is_intersecting: bool,
 
-    pub fn deinit(self: *IntersectionObserverEntry, _: bool, session: *Session) void {
+    pub fn deinit(self: *IntersectionObserverEntry, session: *Session) void {
         session.releaseArena(self._arena);
+    }
+
+    pub fn releaseRef(self: *IntersectionObserverEntry, session: *Session) void {
+        self._rc.release(self, session);
+    }
+
+    pub fn acquireRef(self: *IntersectionObserverEntry) void {
+        self._rc.acquire();
     }
 
     pub fn getTarget(self: *const IntersectionObserverEntry) *Element {
@@ -337,8 +378,6 @@ pub const IntersectionObserverEntry = struct {
             pub const name = "IntersectionObserverEntry";
             pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
-            pub const weak = true;
-            pub const finalizer = bridge.finalizer(IntersectionObserverEntry.deinit);
         };
 
         pub const target = bridge.accessor(IntersectionObserverEntry.getTarget, null, .{});
@@ -358,7 +397,6 @@ pub const JsApi = struct {
         pub const name = "IntersectionObserver";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const finalizer = bridge.finalizer(IntersectionObserver.deinit);
     };
 
     pub const constructor = bridge.constructor(init, .{});

@@ -17,8 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const CDP = @import("../CDP.zig");
 
-pub fn processMessage(cmd: anytype) !void {
+pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         dispatchKeyEvent,
         dispatchMouseEvent,
@@ -33,7 +34,7 @@ pub fn processMessage(cmd: anytype) !void {
 }
 
 // https://chromedevtools.github.io/devtools-protocol/tot/Input/#method-dispatchKeyEvent
-fn dispatchKeyEvent(cmd: anytype) !void {
+fn dispatchKeyEvent(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         type: Type,
         key: []const u8 = "",
@@ -51,17 +52,19 @@ fn dispatchKeyEvent(cmd: anytype) !void {
 
     try cmd.sendResult(null, .{});
 
-    // quickly ignore types we know we don't handle
-    switch (params.type) {
-        .keyUp, .rawKeyDown, .char => return,
-        .keyDown => {},
-    }
+    // rawKeyDown is a Chrome-internal event type not used for JS dispatch
+    if (params.type == .rawKeyDown) return;
 
     const bc = cmd.browser_context orelse return;
     const page = bc.session.currentPage() orelse return;
 
     const KeyboardEvent = @import("../../browser/webapi/event/KeyboardEvent.zig");
-    const keyboard_event = try KeyboardEvent.initTrusted(comptime .wrap("keydown"), .{
+    const keyboard_event = try KeyboardEvent.initTrusted(switch (params.type) {
+        .keyDown => comptime .wrap("keydown"),
+        .keyUp => comptime .wrap("keyup"),
+        .char => comptime .wrap("keypress"),
+        .rawKeyDown => unreachable,
+    }, .{
         .key = params.key,
         .code = params.code,
         .altKey = params.modifiers & 1 == 1,
@@ -74,7 +77,7 @@ fn dispatchKeyEvent(cmd: anytype) !void {
 }
 
 // https://chromedevtools.github.io/devtools-protocol/tot/Input/#method-dispatchMouseEvent
-fn dispatchMouseEvent(cmd: anytype) !void {
+fn dispatchMouseEvent(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         x: f64,
         y: f64,
@@ -104,7 +107,7 @@ fn dispatchMouseEvent(cmd: anytype) !void {
 }
 
 // https://chromedevtools.github.io/devtools-protocol/tot/Input/#method-insertText
-fn insertText(cmd: anytype) !void {
+fn insertText(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         text: []const u8, // The text to insert
     })) orelse return error.InvalidParams;

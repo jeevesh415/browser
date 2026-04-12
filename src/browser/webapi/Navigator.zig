@@ -40,8 +40,8 @@ pub fn getUserAgent(_: *const Navigator, page: *Page) []const u8 {
     return page._session.browser.app.config.http_headers.user_agent;
 }
 
-pub fn getLanguages(_: *const Navigator) [1][]const u8 {
-    return .{"en-US"};
+pub fn getLanguages(_: *const Navigator) [2][]const u8 {
+    return .{ "en-US", "en" };
 }
 
 pub fn getPlatform(_: *const Navigator) []const u8 {
@@ -73,7 +73,7 @@ pub fn getStorage(self: *Navigator) *StorageManager {
 
 pub fn getBattery(_: *const Navigator, page: *Page) !js.Promise {
     log.info(.not_implemented, "navigator.getBattery", .{});
-    return page.js.local.?.rejectErrorPromise(.{ .dom_exception = error.NotSupported });
+    return page.js.local.?.rejectErrorPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
 }
 
 pub fn registerProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, page: *const Page) !void {

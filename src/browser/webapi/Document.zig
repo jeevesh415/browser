@@ -61,7 +61,7 @@ _fonts: ?*FontFaceSet = null,
 _write_insertion_point: ?*Node = null,
 _script_created_parser: ?Parser.Streaming = null,
 _adopted_style_sheets: ?js.Object.Global = null,
-_selection: Selection = .init,
+_selection: Selection = .{ ._rc = .init(1) },
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#throw-on-dynamic-markup-insertion-counter
 // Incremented during custom element reactions when parsing. When > 0,
@@ -548,35 +548,8 @@ pub fn prepend(self: *Document, nodes: []const Node.NodeOrText, page: *Page) !vo
 }
 
 pub fn replaceChildren(self: *Document, nodes: []const Node.NodeOrText, page: *Page) !void {
-    try validateDocumentNodes(self, nodes, true);
-
-    page.domChanged();
-    const parent = self.asNode();
-
-    // Remove all existing children
-    var it = parent.childrenIterator();
-    while (it.next()) |child| {
-        page.removeNode(parent, child, .{ .will_be_reconnected = false });
-    }
-
-    // Append new children
-    const parent_is_connected = parent.isConnected();
-    for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(page);
-
-        // DocumentFragments are special - append all their children
-        if (child.is(Node.DocumentFragment)) |_| {
-            try page.appendAllChildren(child, parent);
-            continue;
-        }
-
-        var child_connected = false;
-        if (child._parent) |previous_parent| {
-            child_connected = child.isConnected();
-            page.removeNode(previous_parent, child, .{ .will_be_reconnected = parent_is_connected });
-        }
-        try page.appendNode(parent, child, .{ .child_already_connected = child_connected });
-    }
+    try validateDocumentNodes(self, nodes, false);
+    return self.asNode().replaceChildren(nodes, page);
 }
 
 pub fn elementFromPoint(self: *Document, x: f64, y: f64, page: *Page) !?*Element {
@@ -591,7 +564,7 @@ pub fn elementFromPoint(self: *Document, x: f64, y: f64, page: *Page) !?*Element
     while (stack.items.len > 0) {
         const node = stack.pop() orelse break;
         if (node.is(Element)) |element| {
-            if (element.checkVisibility(page)) {
+            if (element.checkVisibilityCached(null, page)) {
                 const rect = element.getBoundingClientRectForVisible(page);
                 if (x >= rect.getLeft() and x <= rect.getRight() and y >= rect.getTop() and y <= rect.getBottom()) {
                     topmost = element;
@@ -672,7 +645,7 @@ pub fn write(self: *Document, text: []const []const u8, page: *Page) !void {
             if (self._script_created_parser) |*parser| {
                 parser.read(html) catch |err| {
                     log.warn(.dom, "document.write parser error", .{ .err = err });
-                    // was alrady closed
+                    // was already closed
                     self._script_created_parser = null;
                 };
             }
@@ -684,7 +657,7 @@ pub fn write(self: *Document, text: []const []const u8, page: *Page) !void {
     const script = self._current_script.?;
     const parent = script.asNode().parentNode() orelse return;
 
-    // Our implemnetation is hacky. We'll write to a DocumentFragment, then
+    // Our implementation is hacky. We'll write to a DocumentFragment, then
     // append its children.
     const fragment = try Node.DocumentFragment.init(page);
     const fragment_node = fragment.asNode();
@@ -693,7 +666,7 @@ pub fn write(self: *Document, text: []const []const u8, page: *Page) !void {
     page._parse_mode = .document_write;
     defer page._parse_mode = previous_parse_mode;
 
-    const arena = try page.getArena(.{ .debug = "Document.write" });
+    const arena = try page.getArena(.medium, "Document.write");
     defer page.releaseArena(arena);
 
     var parser = Parser.init(arena, fragment_node, page);
@@ -717,9 +690,16 @@ pub fn write(self: *Document, text: []const []const u8, page: *Page) !void {
     }
 
     // Determine insertion point:
-    // - If _write_insertion_point is set, continue from there (subsequent write)
-    // - Otherwise, start after the script (first write)
-    var insert_after: ?*Node = self._write_insertion_point orelse script.asNode();
+    // - If _write_insertion_point is set and still parented correctly, continue from there
+    // - Otherwise, start after the script (first write, or previous insertion point was removed)
+    var insert_after: ?*Node = blk: {
+        if (self._write_insertion_point) |wip| {
+            if (wip._parent == parent) {
+                break :blk wip;
+            }
+        }
+        break :blk script.asNode();
+    };
 
     for (children_to_insert.items) |child| {
         // Clear parent pointer (child is currently parented to fragment/HTML wrapper)
@@ -896,6 +876,10 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                                 if (has_doctype) {
                                     return error.HierarchyError;
                                 }
+                                if (has_element) {
+                                    // Doctype cannot be inserted if document already has an element
+                                    return error.HierarchyError;
+                                }
                                 has_doctype = true;
                             },
                             .cdata => |cd| switch (cd._type) {
@@ -916,6 +900,10 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                         },
                         .document_type => {
                             if (has_doctype) {
+                                return error.HierarchyError;
+                            }
+                            if (has_element) {
+                                // Doctype cannot be inserted if document already has an element
                                 return error.HierarchyError;
                             }
                             has_doctype = true;
@@ -1080,10 +1068,15 @@ pub const JsApi = struct {
     pub const hasFocus = bridge.function(Document.hasFocus, .{});
 
     pub const prerendering = bridge.property(false, .{ .template = false });
-    pub const characterSet = bridge.property("UTF-8", .{ .template = false });
-    pub const charset = bridge.property("UTF-8", .{ .template = false });
-    pub const inputEncoding = bridge.property("UTF-8", .{ .template = false });
+    pub const characterSet = bridge.accessor(getCharacterSet, null, .{});
+    pub const charset = bridge.accessor(getCharacterSet, null, .{});
+    pub const inputEncoding = bridge.accessor(getCharacterSet, null, .{});
     pub const compatMode = bridge.property("CSS1Compat", .{ .template = false });
+
+    fn getCharacterSet(self: *const Document) []const u8 {
+        const doc_page = self._page orelse return "UTF-8";
+        return doc_page.charset;
+    }
     pub const referrer = bridge.property("", .{ .template = false });
 };
 

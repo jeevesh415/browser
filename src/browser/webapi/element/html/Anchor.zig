@@ -39,12 +39,11 @@ pub fn asNode(self: *Anchor) *Node {
 }
 
 pub fn getHref(self: *Anchor, page: *Page) ![]const u8 {
-    const element = self.asElement();
-    const href = element.getAttributeSafe(comptime .wrap("href")) orelse return "";
+    const href = self.asElement().getAttributeSafe(comptime .wrap("href")) orelse return "";
     if (href.len == 0) {
         return "";
     }
-    return URL.resolve(page.call_arena, page.base(), href, .{ .encode = true });
+    return self.asNode().resolveURL(href, page, .{});
 }
 
 pub fn setHref(self: *Anchor, value: []const u8, page: *Page) !void {
@@ -174,6 +173,14 @@ pub fn setType(self: *Anchor, value: []const u8, page: *Page) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("type"), .wrap(value), page);
 }
 
+pub fn getRel(self: *Anchor) []const u8 {
+    return self.asConstElement().getAttributeSafe(comptime .wrap("rel")) orelse "";
+}
+
+pub fn setRel(self: *Anchor, value: []const u8, page: *Page) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("rel"), .wrap(value), page);
+}
+
 pub fn getName(self: *const Anchor) []const u8 {
     return self.asConstElement().getAttributeSafe(comptime .wrap("name")) orelse "";
 }
@@ -195,7 +202,7 @@ fn getResolvedHref(self: *Anchor, page: *Page) !?[:0]const u8 {
     if (href.len == 0) {
         return null;
     }
-    return try URL.resolve(page.call_arena, page.base(), href, .{});
+    return try self.asNode().resolveURL(href, page, .{});
 }
 
 pub const JsApi = struct {
@@ -218,6 +225,7 @@ pub const JsApi = struct {
     pub const pathname = bridge.accessor(Anchor.getPathname, Anchor.setPathname, .{});
     pub const search = bridge.accessor(Anchor.getSearch, Anchor.setSearch, .{});
     pub const hash = bridge.accessor(Anchor.getHash, Anchor.setHash, .{});
+    pub const rel = bridge.accessor(Anchor.getRel, Anchor.setRel, .{});
     pub const @"type" = bridge.accessor(Anchor.getType, Anchor.setType, .{});
     pub const text = bridge.accessor(Anchor.getText, Anchor.setText, .{});
     pub const relList = bridge.accessor(_getRelList, null, .{ .null_as_undefined = true });

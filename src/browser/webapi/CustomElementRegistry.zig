@@ -24,7 +24,6 @@ const Page = @import("../Page.zig");
 
 const Node = @import("Node.zig");
 const Element = @import("Element.zig");
-const DOMException = @import("DOMException.zig");
 const Custom = @import("element/html/Custom.zig");
 const CustomElementDefinition = @import("CustomElementDefinition.zig");
 
@@ -125,8 +124,8 @@ pub fn whenDefined(self: *CustomElementRegistry, name: []const u8, page: *Page) 
         return local.resolvePromise(definition.constructor);
     }
 
-    validateName(name) catch |err| {
-        return local.rejectPromise(DOMException.fromError(err) orelse unreachable);
+    validateName(name) catch |err| switch (err) {
+        error.SyntaxError => return local.rejectPromise(.{ .dom_exception = .{ .err = error.SyntaxError } }),
     };
 
     const gop = try self._when_defined.getOrPut(page.arena, name);

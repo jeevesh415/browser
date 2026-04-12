@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const log = @import("../../../log.zig");
 const js = @import("../../js/js.zig");
 const Page = @import("../../Page.zig");
@@ -33,6 +34,7 @@ const PlayState = enum {
     finished,
 };
 
+_rc: lp.RC(u32) = .{},
 _page: *Page,
 _arena: Allocator,
 
@@ -50,7 +52,7 @@ _playState: PlayState = .idle,
 //
 // TODO add support for effect and timeline
 pub fn init(page: *Page) !*Animation {
-    const arena = try page.getArena(.{ .debug = "Animation" });
+    const arena = try page.getArena(.tiny, "Animation");
     errdefer page.releaseArena(arena);
 
     const self = try arena.create(Animation);
@@ -62,8 +64,16 @@ pub fn init(page: *Page) !*Animation {
     return self;
 }
 
-pub fn deinit(self: *Animation, _: bool, session: *Session) void {
+pub fn deinit(self: *Animation, session: *Session) void {
     session.releaseArena(self._arena);
+}
+
+pub fn releaseRef(self: *Animation, session: *Session) void {
+    self._rc.release(self, session);
+}
+
+pub fn acquireRef(self: *Animation) void {
+    self._rc.acquire();
 }
 
 pub fn play(self: *Animation, page: *Page) !void {
@@ -75,7 +85,7 @@ pub fn play(self: *Animation, page: *Page) !void {
     self._playState = .running;
 
     // Schedule the transition from .running => .finished in 10ms.
-    page.js.strongRef(self);
+    self.acquireRef();
     try page.js.scheduler.add(
         self,
         Animation.update,
@@ -173,7 +183,7 @@ pub fn getOnFinish(self: *const Animation) ?js.Function.Temp {
     return self._onFinish;
 }
 
-// callback function transitionning from a state to another
+// callback function transitioning from a state to another
 fn update(ctx: *anyopaque) !?u32 {
     const self: *Animation = @ptrCast(@alignCast(ctx));
 
@@ -201,7 +211,7 @@ fn update(ctx: *anyopaque) !?u32 {
     }
 
     // No future change scheduled, set the object weak for garbage collection.
-    self._page.js.weakRef(self);
+    self.releaseRef(self._page._session);
     return null;
 }
 
@@ -220,8 +230,6 @@ pub const JsApi = struct {
         pub const name = "Animation";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const weak = true;
-        pub const finalizer = bridge.finalizer(Animation.deinit);
     };
 
     pub const play = bridge.function(Animation.play, .{});

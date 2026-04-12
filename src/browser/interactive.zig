@@ -36,6 +36,7 @@ pub const InteractivityType = enum {
 };
 
 pub const InteractiveElement = struct {
+    backendNodeId: ?u32 = null,
     node: *Node,
     tag_name: []const u8,
     role: ?[]const u8,
@@ -54,6 +55,11 @@ pub const InteractiveElement = struct {
 
     pub fn jsonStringify(self: *const InteractiveElement, jw: anytype) !void {
         try jw.beginObject();
+
+        if (self.backendNodeId) |id| {
+            try jw.objectField("backendNodeId");
+            try jw.write(id);
+        }
 
         try jw.objectField("tagName");
         try jw.write(self.tag_name);
@@ -123,6 +129,15 @@ pub const InteractiveElement = struct {
     }
 };
 
+/// Populate backendNodeId on each interactive element by registering
+/// their nodes in the given registry. Works with both CDP and MCP registries.
+pub fn registerNodes(elements: []InteractiveElement, registry: anytype) !void {
+    for (elements) |*el| {
+        const registered = try registry.register(el.node);
+        el.backendNodeId = registered.id;
+    }
+}
+
 /// Collect all interactive elements under `root`.
 pub fn collectInteractiveElements(
     root: *Node,
@@ -132,6 +147,8 @@ pub fn collectInteractiveElements(
     // Pre-build a map of event_target pointer → event type names,
     // so classify and getListenerTypes are both O(1) per element.
     const listener_targets = try buildListenerTargetMap(page, arena);
+
+    var css_cache: Element.PointerEventsCache = .empty;
 
     var results: std.ArrayList(InteractiveElement) = .empty;
 
@@ -146,7 +163,7 @@ pub fn collectInteractiveElements(
             else => {},
         }
 
-        const itype = classifyInteractivity(el, html_el, listener_targets) orelse continue;
+        const itype = classifyInteractivity(page, el, html_el, listener_targets, &css_cache) orelse continue;
 
         const listener_types = getListenerTypes(
             el.asEventTarget(),
@@ -160,12 +177,12 @@ pub fn collectInteractiveElements(
             .name = try getAccessibleName(el, arena),
             .interactivity_type = itype,
             .listener_types = listener_types,
-            .disabled = isDisabled(el),
+            .disabled = el.isDisabled(),
             .tab_index = html_el.getTabIndex(),
             .id = el.getAttributeSafe(comptime .wrap("id")),
             .class = el.getAttributeSafe(comptime .wrap("class")),
             .href = if (el.getAttributeSafe(comptime .wrap("href"))) |href|
-                URL.resolve(arena, page.base(), href, .{ .encode = true }) catch href
+                URL.resolve(arena, page.base(), href, .{ .encoding = page.charset }) catch href
             else
                 null,
             .input_type = getInputType(el),
@@ -187,7 +204,7 @@ pub fn buildListenerTargetMap(page: *Page, arena: Allocator) !ListenerTargetMap 
     var map = ListenerTargetMap{};
 
     // addEventListener registrations
-    var it = page._event_manager.lookup.iterator();
+    var it = page._event_manager.base.lookup.iterator();
     while (it.next()) |entry| {
         const list = entry.value_ptr.*;
         if (list.first != null) {
@@ -210,10 +227,14 @@ pub fn buildListenerTargetMap(page: *Page, arena: Allocator) !ListenerTargetMap 
 }
 
 pub fn classifyInteractivity(
+    page: *Page,
     el: *Element,
     html_el: *Element.Html,
     listener_targets: ListenerTargetMap,
+    cache: ?*Element.PointerEventsCache,
 ) ?InteractivityType {
+    if (el.hasPointerEventsNone(cache, page)) return null;
+
     // 1. Native interactive by tag
     switch (el.getTag()) {
         .button, .summary, .details, .select, .textarea => return .native,
@@ -406,36 +427,6 @@ fn getTextContent(node: *Node, arena: Allocator) !?[]const u8 {
     // strip out trailing space
     return arr.items[0 .. arr.items.len - 1];
 }
-fn isDisabled(el: *Element) bool {
-    if (el.getAttributeSafe(comptime .wrap("disabled")) != null) return true;
-    return isDisabledByFieldset(el);
-}
-
-/// Check if an element is disabled by an ancestor <fieldset disabled>.
-/// Per spec, elements inside the first <legend> child of a disabled fieldset
-/// are NOT disabled by that fieldset.
-fn isDisabledByFieldset(el: *Element) bool {
-    const element_node = el.asNode();
-    var current: ?*Node = element_node._parent;
-    while (current) |node| {
-        current = node._parent;
-        const ancestor = node.is(Element) orelse continue;
-
-        if (ancestor.getTag() == .fieldset and ancestor.getAttributeSafe(comptime .wrap("disabled")) != null) {
-            // Check if element is inside the first <legend> child of this fieldset
-            var child = ancestor.firstElementChild();
-            while (child) |c| {
-                if (c.getTag() == .legend) {
-                    if (c.asNode().contains(element_node)) return false;
-                    break;
-                }
-                child = c.nextElementSibling();
-            }
-            return true;
-        }
-    }
-    return false;
-}
 
 fn getInputType(el: *Element) ?[]const u8 {
     if (el.is(Element.Html.Input)) |input| {
@@ -552,6 +543,11 @@ test "browser.interactive: disabled by fieldset" {
     try testing.expect(elements[0].disabled);
     // Button inside first legend is NOT disabled
     try testing.expect(!elements[1].disabled);
+}
+
+test "browser.interactive: pointer-events none" {
+    const elements = try testInteractive("<button style=\"pointer-events: none;\">Click me</button>");
+    try testing.expectEqual(0, elements.len);
 }
 
 test "browser.interactive: non-interactive div" {
