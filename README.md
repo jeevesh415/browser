@@ -38,11 +38,24 @@ See [benchmark details](https://github.com/lightpanda-io/demo/blob/main/BENCHMAR
 ## Quick start
 
 ### Install
-**Install from the nightly builds**
+
+**Package Managers**
+
+Latest nightly from Homebrew:
+```console
+brew install lightpanda-io/browser/lightpanda
+```
+
+Latest nightly from Arch Linux User Repository:
+```console
+yay -S lightpanda-nightly-bi
+```
+
+**Download from the nightly builds**
 
 You can download the last binary from the [nightly
 builds](https://github.com/lightpanda-io/browser/releases/tag/nightly) for
-Linux x86_64 and MacOS aarch64.
+Linux and MacOS for both x86_64 and aarch64.
 
 *For Linux*
 ```console
@@ -50,7 +63,14 @@ curl -L -o lightpanda https://github.com/lightpanda-io/browser/releases/download
 chmod a+x ./lightpanda
 ```
 
+Verify the binary before running anything:
+```console
+./lightpanda version
+```
+
 [Linux aarch64 is also available](https://github.com/lightpanda-io/browser/releases/tag/nightly)
+
+> **Note:** The Linux release binaries are linked against glibc. On musl-based distros (Alpine, etc.) the binary fails with `cannot execute: required file not found` because the glibc dynamic linker is missing. Use a glibc-based base image (e.g., `FROM debian:bookworm-slim` or `FROM ubuntu:24.04`) or [build from sources](#build-from-sources).
 
 *For MacOS*
 ```console
@@ -110,12 +130,12 @@ const browser = await puppeteer.connect({
 
 // The rest of your script remains the same.
 const context = await browser.createBrowserContext();
-const page = await context.newPage();
+const frame = await context.newPage();
 
-// Dump all the links from the page.
-await page.goto('https://demo-browser.lightpanda.io/amiibo/', {waitUntil: "networkidle0"});
+// Dump all the links from the frame.
+await frame.goto('https://demo-browser.lightpanda.io/amiibo/', {waitUntil: "networkidle0"});
 
-const links = await page.evaluate(() => {
+const links = await frame.evaluate(() => {
   return Array.from(document.querySelectorAll('a')).map(row => {
     return row.getAttribute('href');
   });
@@ -123,7 +143,7 @@ const links = await page.evaluate(() => {
 
 console.log(links);
 
-await page.close();
+await frame.close();
 await context.close();
 await browser.disconnect();
 ```
@@ -214,7 +234,7 @@ brew install cmake
 
 ### Build and run
 
-You an build the entire browser with `make build` or `make build-dev` for debug
+You can build the entire browser with `make build` or `make build-dev` for debug
 env.
 
 But you can directly use the zig command: `zig build run`.
@@ -241,6 +261,15 @@ See [#1279](https://github.com/lightpanda-io/browser/pull/1279) for more details
 ### Unit Tests
 
 You can test Lightpanda by running `make test`.
+
+```bash
+make test                                       # Run all tests
+make test F="server"                            # Filter by substring
+TEST_FILTER="WebApi: #selector_all" make test   # Filter main + subtest (separator: #)
+TEST_VERBOSE=true make test
+TEST_FAIL_FIRST=true make test
+METRICS=true make test                          # Capture allocation/duration metrics as JSON
+```
 
 ### End to end tests
 
@@ -310,7 +339,7 @@ Run a Lightpanda browser
 zig build run -- --insecure-disable-tls-host-verification
 ```
 
-Then you can start the wptrunner from the Demo's clone dir:
+Then you can start the wptrunner from the demo's clone dir:
 ```
 cd wptrunner && go run .
 ```

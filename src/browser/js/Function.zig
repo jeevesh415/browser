@@ -17,10 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("js.zig");
-const v8 = js.v8;
+const lp = @import("lightpanda");
 
-const log = @import("../../log.zig");
+const js = @import("js.zig");
+
+const v8 = js.v8;
+const log = lp.log;
 
 const Function = @This();
 
@@ -179,7 +181,7 @@ fn getThis(self: *const Function) js.Object {
 }
 
 pub fn src(self: *const Function) ![]const u8 {
-    return self.local.valueToString(.{ .local = self.local, .handle = @ptrCast(self.handle) }, .{});
+    return js.Value.toStringSlice(.{ .local = self.local, .handle = @ptrCast(self.handle) });
 }
 
 pub fn getPropertyValue(self: *const Function, name: []const u8) !?js.Value {
@@ -213,7 +215,7 @@ fn _persist(self: *const Function, comptime is_global: bool) !(if (is_global) Gl
         return .{ .handle = global, .temps = {} };
     }
     try ctx.trackTemp(global);
-    return .{ .handle = global, .temps = &ctx.session.temps };
+    return .{ .handle = global, .temps = &ctx.page.temps };
 }
 
 pub fn tempWithThis(self: *const Function, value: anytype) !Temp {

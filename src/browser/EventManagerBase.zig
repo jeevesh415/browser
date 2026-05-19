@@ -17,19 +17,18 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const builtin = @import("builtin");
 
-const log = @import("../log.zig");
-const String = @import("../string.zig").String;
-
 const js = @import("js/js.zig");
-const Session = @import("Session.zig");
+const Page = @import("Page.zig");
 
 const Event = @import("webapi/Event.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
 
+const log = lp.log;
+const String = lp.String;
 const Allocator = std.mem.Allocator;
-
 const IS_DEBUG = builtin.mode == .Debug;
 
 const EventKey = struct {
@@ -90,7 +89,13 @@ pub const Callback = union(enum) {
     object: js.Object,
 };
 
-pub fn register(self: *EventManagerBase, target: *EventTarget, typ: []const u8, callback: Callback, opts: RegisterOptions) !*Listener {
+// Returns null when the listener is a no-op per spec: signal already
+// aborted, or a duplicate (same type + callback + capture) of an
+// already-registered listener. Real errors (OOM, StringTooLarge) still
+// propagate. Callers don't have to distinguish "skipped" from "registered"
+// unless they need the resulting *Listener (e.g. Frame's load-listener
+// tracking).
+pub fn register(self: *EventManagerBase, target: *EventTarget, typ: []const u8, callback: Callback, opts: RegisterOptions) !?*Listener {
     if (comptime IS_DEBUG) {
         log.debug(.event, "EventManager.register", .{
             .type = typ,
@@ -103,7 +108,7 @@ pub fn register(self: *EventManagerBase, target: *EventTarget, typ: []const u8, 
     // If a signal is provided and already aborted, don't register the listener
     if (opts.signal) |signal| {
         if (signal.getAborted()) {
-            return error.SignalAborted;
+            return null;
         }
     }
 
@@ -115,18 +120,22 @@ pub fn register(self: *EventManagerBase, target: *EventTarget, typ: []const u8, 
         .event_target = @intFromPtr(target),
     });
     if (gop.found_existing) {
-        // check for duplicate callbacks already registered
+        // check for duplicate callbacks already registered. Listeners that
+        // have been removed (e.g. a `once` listener that fired mid-dispatch
+        // and is awaiting destruction in deferred_removals) are not "in"
+        // the listener list per spec — skip them.
         var node = gop.value_ptr.*.first;
         while (node) |n| {
             const listener: *Listener = @alignCast(@fieldParentPtr("node", n));
+            node = n.next;
+            if (listener.removed) continue;
             const is_duplicate = switch (callback) {
                 .object => |obj| listener.function.eqlObject(obj),
                 .function => |func| listener.function.eqlFunction(func),
             };
             if (is_duplicate and listener.capture == opts.capture) {
-                return error.DuplicateListener;
+                return null;
             }
-            node = n.next;
         }
     } else {
         gop.value_ptr.* = try self.list_pool.create();
@@ -165,6 +174,11 @@ pub fn remove(self: *EventManagerBase, target: *EventTarget, typ: []const u8, ca
 }
 
 pub fn removeListener(self: *EventManagerBase, list: *std.DoublyLinkedList, listener: *Listener) void {
+    // Already removed (or queued for removal). Avoids double-pushing the
+    // same listener into deferred_removals — which would double-free at
+    // the outer-dispatch cleanup — if e.g. a `once` listener also calls
+    // removeEventListener on itself.
+    if (listener.removed) return;
     // If we're in a dispatch, defer removal to avoid invalidating iteration
     if (self.dispatch_depth > 0) {
         listener.removed = true;
@@ -217,7 +231,7 @@ pub fn dispatchDirect(
     target: *EventTarget,
     event: *Event,
     handler: anytype,
-    session: *Session,
+    page: *Page,
     comptime opts: DispatchDirectOptions,
 ) DispatchError!void {
     if (comptime IS_DEBUG) {
@@ -225,7 +239,7 @@ pub fn dispatchDirect(
     }
 
     event.acquireRef();
-    defer _ = event.releaseRef(session);
+    defer _ = event.releaseRef(page);
 
     if (comptime opts.inject_target) {
         event._target = target;
@@ -257,16 +271,14 @@ pub fn dispatchDirect(
     // Track dispatch depth for deferred removal
     self.dispatch_depth += 1;
     defer {
-        const dispatch_depth = self.dispatch_depth;
+        self.dispatch_depth -= 1;
         // Only destroy deferred listeners when we exit the outermost dispatch
-        if (dispatch_depth == 1) {
+        if (self.dispatch_depth == 0) {
             for (self.deferred_removals.items) |removal| {
                 removal.list.remove(&removal.listener.node);
                 self.listener_pool.destroy(removal.listener);
             }
             self.deferred_removals.clearRetainingCapacity();
-        } else {
-            self.dispatch_depth = dispatch_depth - 1;
         }
     }
 
@@ -305,20 +317,11 @@ pub fn dispatchDirect(
         }
 
         event._current_target = target;
+        event._in_passive_listener = listener.passive;
 
-        switch (listener.function) {
-            .value => |value| try ls.local.toLocal(value).callWithThis(void, target, .{event}),
-            .string => |string| {
-                const str = try arena.dupeZ(u8, string.str());
-                try ls.local.eval(str, null);
-            },
-            .object => |obj_global| {
-                const obj = ls.local.toLocal(obj_global);
-                if (try obj.getFunction("handleEvent")) |handleEvent| {
-                    try handleEvent.callWithThis(void, obj, .{event});
-                }
-            },
-        }
+        try listener.run(arena, &ls.local, event, opts.context);
+
+        event._in_passive_listener = false;
 
         if (event._stop_immediate_propagation) {
             return;
@@ -369,6 +372,10 @@ fn findListener(list: *const std.DoublyLinkedList, callback: Callback, capture: 
     while (node) |n| {
         node = n.next;
         const listener: *Listener = @alignCast(@fieldParentPtr("node", n));
+        // Per spec, a removed listener isn't "in" the list anymore; skip
+        // entries still present only because their deferred removal hasn't
+        // been flushed yet.
+        if (listener.removed) continue;
         const matches = switch (callback) {
             .object => |obj| listener.function.eqlObject(obj),
             .function => |func| listener.function.eqlFunction(func),
@@ -393,6 +400,46 @@ pub const Listener = struct {
     signal: ?*@import("webapi/AbortSignal.zig") = null,
     node: std.DoublyLinkedList.Node,
     removed: bool = false,
+
+    // Per DOM §2.9 step 4 substep 8 ("Inner invoke"), a listener callback that
+    // throws must have its exception *reported* to the global error handler,
+    // not propagated to the dispatch caller — subsequent listeners on the same
+    // target and the rest of the propagation path must still run.
+    //
+    // Caller must set `event._current_target` before invoking — the function-
+    // listener variant uses it as `this`, matching the spec contract that a
+    // listener sees its current target via both `event.currentTarget` and `this`.
+    pub fn run(
+        self: *const Listener,
+        arena: Allocator,
+        local: *const js.Local,
+        event: *Event,
+        comptime context: []const u8,
+    ) error{OutOfMemory}!void {
+        switch (self.function) {
+            .value => |value| local.toLocal(value).callWithThis(void, event._current_target.?, .{event}) catch |err| {
+                log.warn(.event, context, .{ .err = err });
+            },
+            .string => |string| {
+                const str = try arena.dupeZ(u8, string.str());
+                local.eval(str, null) catch |err| {
+                    log.warn(.event, context, .{ .err = err });
+                };
+            },
+            .object => |obj_global| {
+                const obj = local.toLocal(obj_global);
+                const handle_event = obj.getFunction("handleEvent") catch |err| blk: {
+                    log.warn(.event, context, .{ .err = err });
+                    break :blk null;
+                };
+                if (handle_event) |handleEvent| {
+                    handleEvent.callWithThis(void, obj, .{event}) catch |err| {
+                        log.warn(.event, context, .{ .err = err });
+                    };
+                }
+            },
+        }
+    }
 };
 
 pub const Function = union(enum) {

@@ -20,27 +20,30 @@ const std = @import("std");
 const lp = @import("lightpanda");
 const js = @import("../../js/js.zig");
 
-const log = @import("../../../log.zig");
 const HttpClient = @import("../../HttpClient.zig");
 const http = @import("../../../network/http.zig");
 
 const URL = @import("../../URL.zig");
 const Mime = @import("../../Mime.zig");
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
 
 const Node = @import("../Node.zig");
 const Event = @import("../Event.zig");
-const Headers = @import("Headers.zig");
 const EventTarget = @import("../EventTarget.zig");
+
+const Headers = @import("Headers.zig");
+const Request = @import("Request.zig");
+const BodyInit = @import("body_init.zig").BodyInit;
 const XMLHttpRequestEventTarget = @import("XMLHttpRequestEventTarget.zig");
 
+const log = lp.log;
+const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const XMLHttpRequest = @This();
 _rc: lp.RC(u8) = .{},
-_page: *Page,
+_exec: *const Execution,
 _proto: *XMLHttpRequestEventTarget,
 _arena: Allocator,
 _http_response: ?HttpClient.Response = null,
@@ -88,19 +91,19 @@ const ResponseType = enum {
     // TODO: other types to support
 };
 
-pub fn init(page: *Page) !*XMLHttpRequest {
-    const arena = try page.getArena(.large, "XMLHttpRequest");
-    errdefer page.releaseArena(arena);
-    const self = try page._factory.xhrEventTarget(arena, XMLHttpRequest{
-        ._page = page,
+pub fn init(exec: *const Execution) !*XMLHttpRequest {
+    const arena = try exec.getArena(.large, "XMLHttpRequest");
+    errdefer exec.releaseArena(arena);
+    const self = try exec._factory.xhrEventTarget(arena, XMLHttpRequest{
+        ._exec = exec,
         ._arena = arena,
         ._proto = undefined,
-        ._request_headers = try Headers.init(null, page),
+        ._request_headers = try Headers.init(null, exec),
     });
     return self;
 }
 
-pub fn deinit(self: *XMLHttpRequest, session: *Session) void {
+pub fn deinit(self: *XMLHttpRequest, page: *Page) void {
     if (self._http_response) |resp| {
         resp.abort(error.Abort);
         self._http_response = null;
@@ -135,19 +138,19 @@ pub fn deinit(self: *XMLHttpRequest, session: *Session) void {
         }
     }
 
-    session.releaseArena(self._arena);
+    page.releaseArena(self._arena);
 }
 
 fn releaseSelfRef(self: *XMLHttpRequest) void {
     if (self._active_request == false) {
         return;
     }
-    self.releaseRef(self._page._session);
     self._active_request = false;
+    self.releaseRef(self._exec.context.page);
 }
 
-pub fn releaseRef(self: *XMLHttpRequest, session: *Session) void {
-    self._rc.release(self, session);
+pub fn releaseRef(self: *XMLHttpRequest, page: *Page) void {
+    self._rc.release(self, page);
 }
 
 pub fn acquireRef(self: *XMLHttpRequest) void {
@@ -208,20 +211,20 @@ pub fn open(self: *XMLHttpRequest, method_: []const u8, url: [:0]const u8) !void
     self._response_headers.clearRetainingCapacity();
     self._request_body = null;
 
-    const page = self._page;
+    const exec = self._exec;
     self._method = try parseMethod(method_);
-    self._url = try URL.resolve(self._arena, page.base(), url, .{ .always_dupe = true, .encoding = page.charset });
-    try self.stateChanged(.opened, page);
+    self._url = try URL.resolve(self._arena, exec.base(), url, .{ .always_dupe = true, .encoding = exec.charset.* });
+    try self.stateChanged(.opened, exec);
 }
 
-pub fn setRequestHeader(self: *XMLHttpRequest, name: []const u8, value: []const u8, page: *Page) !void {
+pub fn setRequestHeader(self: *XMLHttpRequest, name: []const u8, value: []const u8, exec: *const Execution) !void {
     if (self._ready_state != .opened) {
         return error.InvalidStateError;
     }
-    return self._request_headers.append(name, value, page);
+    return self._request_headers.append(name, value, exec);
 }
 
-pub fn send(self: *XMLHttpRequest, body_: ?[]const u8) !void {
+pub fn send(self: *XMLHttpRequest, body_: ?BodyInit, exec_: *const Execution) !void {
     if (comptime IS_DEBUG) {
         log.debug(.http, "XMLHttpRequest.send", .{ .url = self._url });
     }
@@ -231,43 +234,53 @@ pub fn send(self: *XMLHttpRequest, body_: ?[]const u8) !void {
 
     if (body_) |b| {
         if (self._method != .GET and self._method != .HEAD) {
-            self._request_body = try self._arena.dupe(u8, b);
+            const extracted = try b.extract(self._arena);
+            self._request_body = extracted.bytes;
+            // Per XHR §4.7.6 "send()" step 4, the default Content-Type only
+            // applies if the author hasn't already set one via
+            // setRequestHeader.
+            if (extracted.content_type) |ct| {
+                if (!self._request_headers.has("content-type", exec_)) {
+                    try self._request_headers.append("content-type", ct, exec_);
+                }
+            }
         }
     }
 
-    const page = self._page;
+    const exec = self._exec;
 
     if (std.mem.startsWith(u8, self._url, "blob:")) {
-        return self.handleBlobUrl(page);
+        return self.handleBlobUrl(exec);
     }
 
-    const http_client = page._session.browser.http_client;
+    const session = exec.context.page.session;
+    const http_client = &session.browser.http_client;
     var headers = try http_client.newHeaders();
 
     // Only add cookies for same-origin or when withCredentials is true
-    const cookie_support = self._with_credentials or page.isSameOrigin(self._url);
+    const cookie_support = self._with_credentials or exec.isSameOrigin(self._url);
 
-    try self._request_headers.populateHttpHeader(page.call_arena, &headers);
+    try self._request_headers.populateHttpHeader(exec.call_arena, &headers);
     if (cookie_support) {
-        try page.headersForRequest(&headers);
+        try exec.headersForRequest(&headers);
     }
 
     self.acquireRef();
     self._active_request = true;
 
-    http_client.request(.{
+    exec.makeRequest(.{
         .ctx = self,
         .url = self._url,
         .method = self._method,
         .headers = headers,
-        .page_id = page.id,
-        .frame_id = page._frame_id,
+        .frame_id = exec.frameId(),
+        .loader_id = exec.loaderId(),
         .body = self._request_body,
-        .cookie_jar = if (cookie_support) &page._session.cookie_jar else null,
-        .cookie_origin = page.url,
+        .cookie_jar = if (cookie_support) &session.cookie_jar else null,
+        .cookie_origin = exec.url.*,
         .resource_type = .xhr,
         .timeout_ms = self._timeout,
-        .notification = page._session.notification,
+        .notification = session.notification,
         .start_callback = httpStartCallback,
         .header_callback = httpHeaderDoneCallback,
         .data_callback = httpDataCallback,
@@ -280,8 +293,8 @@ pub fn send(self: *XMLHttpRequest, body_: ?[]const u8) !void {
     };
 }
 
-fn handleBlobUrl(self: *XMLHttpRequest, page: *Page) !void {
-    const blob = page.lookupBlobUrl(self._url) orelse {
+fn handleBlobUrl(self: *XMLHttpRequest, exec: *const Execution) !void {
+    const blob = exec.lookupBlobUrl(self._url) orelse {
         self.handleError(error.BlobNotFound);
         return;
     };
@@ -292,24 +305,24 @@ fn handleBlobUrl(self: *XMLHttpRequest, page: *Page) !void {
     try self._response_data.appendSlice(self._arena, blob._slice);
     self._response_len = blob._slice.len;
 
-    try self.stateChanged(.headers_received, page);
-    try self._proto.dispatch(.load_start, .{ .loaded = 0, .total = self._response_len orelse 0 }, page);
-    try self.stateChanged(.loading, page);
+    try self.stateChanged(.headers_received, exec);
+    try self._proto.dispatch(.load_start, .{ .loaded = 0, .total = self._response_len orelse 0 }, exec);
+    try self.stateChanged(.loading, exec);
     try self._proto.dispatch(.progress, .{
         .total = self._response_len orelse 0,
         .loaded = self._response_data.items.len,
-    }, page);
-    try self.stateChanged(.done, page);
+    }, exec);
+    try self.stateChanged(.done, exec);
 
     const loaded = self._response_data.items.len;
     try self._proto.dispatch(.load, .{
         .total = loaded,
         .loaded = loaded,
-    }, page);
+    }, exec);
     try self._proto.dispatch(.load_end, .{
         .total = loaded,
         .loaded = loaded,
-    }, page);
+    }, exec);
 }
 
 pub fn getReadyState(self: *const XMLHttpRequest) u32 {
@@ -332,14 +345,14 @@ pub fn getResponseHeader(self: *const XMLHttpRequest, name: []const u8) ?[]const
     return null;
 }
 
-pub fn getAllResponseHeaders(self: *const XMLHttpRequest, page: *Page) ![]const u8 {
+pub fn getAllResponseHeaders(self: *const XMLHttpRequest, exec: *const Execution) ![]const u8 {
     if (self._ready_state != .done) {
         // MDN says this should return null, but it seems to return an empty string
         // in every browser. Specs are too hard for a dumbo like me to understand.
         return "";
     }
 
-    var buf = std.Io.Writer.Allocating.init(page.call_arena);
+    var buf = std.Io.Writer.Allocating.init(exec.call_arena);
     for (self._response_headers.items) |entry| {
         try buf.writer.writeAll(entry);
         try buf.writer.writeAll("\r\n");
@@ -376,7 +389,7 @@ pub fn getResponseURL(self: *XMLHttpRequest) []const u8 {
     return self._response_url;
 }
 
-pub fn getResponse(self: *XMLHttpRequest, page: *Page) !?Response {
+pub fn getResponse(self: *XMLHttpRequest, exec: *const Execution) !?Response {
     if (self._ready_state != .done) {
         return null;
     }
@@ -390,13 +403,20 @@ pub fn getResponse(self: *XMLHttpRequest, page: *Page) !?Response {
     const res: Response = switch (self._response_type) {
         .text => .{ .text = data },
         .json => blk: {
-            const value = try page.js.local.?.parseJSON(data);
+            const value = try exec.context.local.?.parseJSON(data);
             break :blk .{ .json = try value.persist() };
         },
         .document => blk: {
-            const document = try page._factory.node(Node.Document{ ._proto = undefined, ._type = .generic });
-            try page.parseHtmlAsChildren(document.asNode(), data);
-            break :blk .{ .document = document };
+            // responseType=document is only meaningful in a Frame; workers
+            // have no DOM. Drastically different impls -> switch on global.
+            switch (exec.context.global) {
+                .frame => |frame| {
+                    const document = try exec._factory.node(Node.Document{ ._proto = undefined, ._type = .generic });
+                    try frame.parseHtmlAsChildren(document.asNode(), data);
+                    break :blk .{ .document = document };
+                },
+                .worker => return error.NotSupportedInWorker,
+            }
         },
         .arraybuffer => .{ .arraybuffer = .{ .values = data } },
     };
@@ -405,8 +425,8 @@ pub fn getResponse(self: *XMLHttpRequest, page: *Page) !?Response {
     return res;
 }
 
-pub fn getResponseXML(self: *XMLHttpRequest, page: *Page) !?*Node.Document {
-    const res = (try self.getResponse(page)) orelse return null;
+pub fn getResponseXML(self: *XMLHttpRequest, exec: *const Execution) !?*Node.Document {
+    const res = (try self.getResponse(exec)) orelse return null;
     return switch (res) {
         .document => |doc| doc,
         else => null,
@@ -462,15 +482,15 @@ fn httpHeaderDoneCallback(response: HttpClient.Response) !bool {
     }
     self._response_url = try self._arena.dupeZ(u8, response.url());
 
-    const page = self._page;
+    const exec = self._exec;
 
     var ls: js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    exec.context.localScope(&ls);
     defer ls.deinit();
 
-    try self.stateChanged(.headers_received, page);
-    try self._proto.dispatch(.load_start, .{ .loaded = 0, .total = self._response_len orelse 0 }, page);
-    try self.stateChanged(.loading, page);
+    try self.stateChanged(.headers_received, exec);
+    try self._proto.dispatch(.load_start, .{ .loaded = 0, .total = self._response_len orelse 0 }, exec);
+    try self.stateChanged(.loading, exec);
 
     return true;
 }
@@ -479,12 +499,10 @@ fn httpDataCallback(response: HttpClient.Response, data: []const u8) !void {
     const self: *XMLHttpRequest = @ptrCast(@alignCast(response.ctx));
     try self._response_data.appendSlice(self._arena, data);
 
-    const page = self._page;
-
     try self._proto.dispatch(.progress, .{
         .total = self._response_len orelse 0,
         .loaded = self._response_data.items.len,
-    }, page);
+    }, self._exec);
 }
 
 fn httpDoneCallback(ctx: *anyopaque) !void {
@@ -501,19 +519,19 @@ fn httpDoneCallback(ctx: *anyopaque) !void {
     // object. It isn't safe to keep it around.
     self._http_response = null;
 
-    const page = self._page;
+    const exec = self._exec;
 
-    try self.stateChanged(.done, page);
+    try self.stateChanged(.done, exec);
 
     const loaded = self._response_data.items.len;
     try self._proto.dispatch(.load, .{
         .total = loaded,
         .loaded = loaded,
-    }, page);
+    }, exec);
     try self._proto.dispatch(.load_end, .{
         .total = loaded,
         .loaded = loaded,
-    }, page);
+    }, exec);
 
     self.releaseSelfRef();
 }
@@ -557,18 +575,18 @@ fn _handleError(self: *XMLHttpRequest, err: anyerror) !void {
 
     const new_state: ReadyState = if (is_abort) .unsent else .done;
     if (new_state != self._ready_state) {
-        const page = self._page;
+        const exec = self._exec;
 
-        try self.stateChanged(new_state, page);
+        try self.stateChanged(new_state, exec);
         if (is_abort) {
-            try self._proto.dispatch(.abort, null, page);
+            try self._proto.dispatch(.abort, null, exec);
         } else if (is_timeout) {
-            try self._proto.dispatch(.timeout, null, page);
+            try self._proto.dispatch(.timeout, null, exec);
         }
         if (!is_timeout) {
-            try self._proto.dispatch(.err, null, page);
+            try self._proto.dispatch(.err, null, exec);
         }
-        try self._proto.dispatch(.load_end, null, page);
+        try self._proto.dispatch(.load_end, null, exec);
     }
 
     const level: log.Level = if (err == error.Abort) .debug else .err;
@@ -579,7 +597,7 @@ fn _handleError(self: *XMLHttpRequest, err: anyerror) !void {
     });
 }
 
-fn stateChanged(self: *XMLHttpRequest, state: ReadyState, page: *Page) !void {
+fn stateChanged(self: *XMLHttpRequest, state: ReadyState, exec: *const Execution) !void {
     if (state == self._ready_state) {
         return;
     }
@@ -587,9 +605,9 @@ fn stateChanged(self: *XMLHttpRequest, state: ReadyState, page: *Page) !void {
     self._ready_state = state;
 
     const target = self.asEventTarget();
-    if (page._event_manager.hasDirectListeners(target, "readystatechange", self._on_ready_state_change)) {
-        const event = try Event.initTrusted(.wrap("readystatechange"), .{}, page);
-        try page._event_manager.dispatchDirect(target, event, self._on_ready_state_change, .{ .context = "XHR state change" });
+    if (exec.hasDirectListeners(target, "readystatechange", self._on_ready_state_change)) {
+        const event = try Event.initTrusted(.wrap("readystatechange"), .{}, exec.context.page);
+        try exec.dispatch(target, event, self._on_ready_state_change, .{ .context = "XHR state change" });
     }
 }
 
@@ -650,4 +668,8 @@ pub const JsApi = struct {
 const testing = @import("../../../testing.zig");
 test "WebApi: XHR" {
     try testing.htmlRunner("net/xhr.html", .{});
+}
+
+test "WebApi: XHR in worker" {
+    try testing.htmlRunner("net/xhr_worker.html", .{});
 }

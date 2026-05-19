@@ -18,12 +18,15 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
-const FontFace = @import("FontFace.zig");
-const EventTarget = @import("../EventTarget.zig");
+const Frame = @import("../../Frame.zig");
+
 const Event = @import("../Event.zig");
+const EventTarget = @import("../EventTarget.zig");
+
+const FontFace = @import("FontFace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -33,22 +36,22 @@ _rc: lp.RC(u8) = .{},
 _proto: *EventTarget,
 _arena: Allocator,
 
-pub fn init(page: *Page) !*FontFaceSet {
-    const arena = try page.getArena(.tiny, "FontFaceSet");
-    errdefer page.releaseArena(arena);
+pub fn init(frame: *Frame) !*FontFaceSet {
+    const arena = try frame.getArena(.tiny, "FontFaceSet");
+    errdefer frame.releaseArena(arena);
 
-    return page._factory.eventTargetWithAllocator(arena, FontFaceSet{
+    return frame._factory.eventTargetWithAllocator(arena, FontFaceSet{
         ._proto = undefined,
         ._arena = arena,
     });
 }
 
-pub fn deinit(self: *FontFaceSet, session: *Session) void {
-    session.releaseArena(self._arena);
+pub fn deinit(self: *FontFaceSet, page: *Page) void {
+    page.releaseArena(self._arena);
 }
 
-pub fn releaseRef(self: *FontFaceSet, session: *Session) void {
-    self._rc.release(self, session);
+pub fn releaseRef(self: *FontFaceSet, page: *Page) void {
+    self._rc.release(self, page);
 }
 
 pub fn acquireRef(self: *FontFaceSet) void {
@@ -61,8 +64,8 @@ pub fn asEventTarget(self: *FontFaceSet) *EventTarget {
 
 // FontFaceSet.ready - returns an already-resolved Promise.
 // In a headless browser there is no font loading, so fonts are always ready.
-pub fn getReady(_: *FontFaceSet, page: *Page) !js.Promise {
-    return page.js.local.?.resolvePromise({});
+pub fn getReady(_: *FontFaceSet, frame: *Frame) !js.Promise {
+    return frame.js.local.?.resolvePromise({});
 }
 
 // check(font, text?) - always true; headless has no real fonts to check.
@@ -72,25 +75,25 @@ pub fn check(_: *const FontFaceSet, font: []const u8) bool {
 }
 
 // load(font, text?) - resolves immediately with an empty array.
-pub fn load(self: *FontFaceSet, font: []const u8, page: *Page) !js.Promise {
+pub fn load(self: *FontFaceSet, font: []const u8, frame: *Frame) !js.Promise {
     // TODO parse font to check if the font has been added before dispatching
     // events.
     _ = font;
 
     // Dispatch loading event
     const target = self.asEventTarget();
-    if (page._event_manager.hasDirectListeners(target, "loading", null)) {
-        const event = try Event.initTrusted(comptime .wrap("loading"), .{}, page);
-        try page._event_manager.dispatchDirect(target, event, null, .{ .context = "load font face set" });
+    if (frame._event_manager.hasDirectListeners(target, "loading", null)) {
+        const event = try Event.initTrusted(comptime .wrap("loading"), .{}, frame._page);
+        try frame._event_manager.dispatchDirect(target, event, null, .{ .context = "load font face set" });
     }
 
     // Dispatch loadingdone event
-    if (page._event_manager.hasDirectListeners(target, "loadingdone", null)) {
-        const event = try Event.initTrusted(comptime .wrap("loadingdone"), .{}, page);
-        try page._event_manager.dispatchDirect(target, event, null, .{ .context = "load font face set" });
+    if (frame._event_manager.hasDirectListeners(target, "loadingdone", null)) {
+        const event = try Event.initTrusted(comptime .wrap("loadingdone"), .{}, frame._page);
+        try frame._event_manager.dispatchDirect(target, event, null, .{ .context = "load font face set" });
     }
 
-    return page.js.local.?.resolvePromise({});
+    return frame.js.local.?.resolvePromise({});
 }
 
 // add(fontFace) - no-op; headless browser does not track loaded fonts.

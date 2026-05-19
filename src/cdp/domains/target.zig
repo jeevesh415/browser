@@ -22,9 +22,10 @@ const lp = @import("lightpanda");
 const id = @import("../id.zig");
 const CDP = @import("../CDP.zig");
 
-const log = @import("../../log.zig");
 const URL = @import("../../browser/URL.zig");
 const js = @import("../../browser/js/js.zig");
+
+const log = lp.log;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
@@ -169,21 +170,21 @@ fn createTarget(cmd: *CDP.Command) !void {
         }
     }
 
-    // if target_id is null, we should never have a page
-    lp.assert(bc.session.page == null, "CDP.target.createTarget not null page", .{});
+    // if target_id is null, we should never have a blank frame
+    lp.assert(!bc.session.hasPage(), "CDP.target.createTarget not null page", .{});
 
     // if target_id is null, we should never have a session_id
     lp.assert(bc.session_id == null, "CDP.target.createTarget not null session_id", .{});
 
-    const page = try bc.session.createPage();
+    const frame = try bc.session.createPage();
 
-    // the target_id == the frame_id of the "root" page
-    const frame_id = id.toFrameId(page._frame_id);
+    // the target_id == the frame_id of the "root" frame
+    const frame_id = id.toFrameId(frame._frame_id);
     bc.target_id = frame_id;
     const target_id = &bc.target_id.?;
     {
         var ls: js.Local.Scope = undefined;
-        page.js.localScope(&ls);
+        frame.js.localScope(&ls);
         defer ls.deinit();
 
         const aux_data = try std.fmt.allocPrint(cmd.arena, "{{\"isDefault\":true,\"type\":\"default\",\"frameId\":\"{s}\"}}", .{target_id});
@@ -191,7 +192,7 @@ fn createTarget(cmd: *CDP.Command) !void {
             &ls.local,
             "",
             "", // @ZIGDOM
-            // try page.origin(arena),
+            // try frame.origin(arena),
             aux_data,
             true,
         );
@@ -220,8 +221,8 @@ fn createTarget(cmd: *CDP.Command) !void {
     }
 
     if (!std.mem.eql(u8, "about:blank", params.url)) {
-        const encoded_url = try URL.ensureEncoded(page.call_arena, params.url, "UTF-8");
-        try page.navigate(
+        const encoded_url = try URL.ensureEncoded(frame.call_arena, params.url, "UTF-8");
+        try frame.navigate(
             encoded_url,
             .{ .reason = .address_bar, .kind = .{ .push = null } },
         );
@@ -283,7 +284,7 @@ fn closeTarget(cmd: *CDP.Command) !void {
     }
 
     // can't be null if we have a target_id
-    lp.assert(bc.session.page != null, "CDP.target.closeTarget null page", .{});
+    lp.assert(bc.session.hasPage(), "CDP.target.closeTarget null frame", .{});
 
     try cmd.sendResult(.{ .success = true }, .{ .include_session_id = false });
 
@@ -425,9 +426,9 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
     // autoAttach is set to true, we must attach to all existing targets.
     if (cmd.browser_context) |bc| {
         if (bc.target_id == null) {
-            if (bc.session.currentPage()) |page| {
-                // the target_id == the frame_id of the "root" page
-                bc.target_id = id.toFrameId(page._frame_id);
+            if (bc.session.currentFrame()) |frame| {
+                // the target_id == the frame_id of the "root" frame
+                bc.target_id = id.toFrameId(frame._frame_id);
                 try doAttachtoTarget(cmd, &bc.target_id.?);
             }
         }
@@ -437,7 +438,7 @@ fn setAutoAttach(cmd: *CDP.Command) !void {
 
     // This is a hack. Puppeteer, and probably others, expect the Browser to
     // automatically started creating targets. Things like an empty tab, or
-    // a blank page. And they block until this happens. So we send an event
+    // a blank frame. And they block until this happens. So we send an event
     // telling them that they've been attached to our Browser. Hopefully, the
     // first thing they'll do is create a real BrowserContext and progress from
     // there.
@@ -462,8 +463,8 @@ fn doAttachtoTarget(cmd: *CDP.Command, target_id: []const u8) !void {
     const session_id = bc.session_id orelse cmd.cdp.session_id_gen.next();
 
     if (bc.session_id == null) {
-        // extra_headers should not be kept on a new page or tab,
-        // currently we have only 1 page, we clear it just in case
+        // extra_headers should not be kept on a new frame or tab,
+        // currently we have only 1 frame, we clear it just in case
         bc.extra_headers.clearRetainingCapacity();
     }
 
@@ -569,6 +570,47 @@ test "cdp.target: disposeBrowserContext" {
     }
 }
 
+// Issue #2472: CDP target IDs (`FID-{d:0>10}`) must stay unique for the
+// lifetime of a CDP connection. Before the fix, `Session.frame_id_gen`
+// reset to 0 on `tearDownActivePage` AND fresh sessions also started
+// from 0, so the second `Target.createTarget` after a dispose re-issued
+// the same `FID-0000000001` and Playwright clients tripped on
+// `Duplicate target FID-...`. The counter now lives on `Browser` and is
+// monotonic across BrowserContexts.
+test "cdp.target: createTarget assigns unique IDs across BrowserContexts (issue #2472)" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    // Cycle 1: create context + target, capture the assigned target_id.
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Target.createTarget",
+        .params = .{ .url = "about:blank" },
+    });
+    const target_id_1 = ctx.cdp().browser_context.?.target_id.?;
+    const bc_id_1 = ctx.cdp().browser_context.?.id;
+
+    // Dispose the first context.
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Target.disposeBrowserContext",
+        .params = .{ .browserContextId = bc_id_1 },
+    });
+    try testing.expectEqual(null, ctx.cdp().browser_context);
+
+    // Cycle 2: create another context + target. The new target_id must
+    // differ from cycle 1's -- duplicates here are exactly what Playwright
+    // asserts on with `Duplicate target FID-...`.
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Target.createTarget",
+        .params = .{ .url = "about:blank" },
+    });
+    const target_id_2 = ctx.cdp().browser_context.?.target_id.?;
+
+    try testing.expect(!std.mem.eql(u8, &target_id_1, &target_id_2));
+}
+
 test "cdp.target: createTarget" {
     {
         var ctx = try testing.context();
@@ -635,7 +677,7 @@ test "cdp.target: closeTarget" {
     {
         try ctx.processMessage(.{ .id = 11, .method = "Target.closeTarget", .params = .{ .targetId = "TID-000000000A" } });
         try ctx.expectSentResult(.{ .success = true }, .{ .id = 11 });
-        try testing.expectEqual(null, bc.session.page);
+        try testing.expectEqual(false, bc.session.hasPage());
         try testing.expectEqual(null, bc.target_id);
     }
 }

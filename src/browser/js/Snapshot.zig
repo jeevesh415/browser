@@ -18,20 +18,20 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+
 const js = @import("js.zig");
 const bridge = @import("bridge.zig");
-const log = @import("../../log.zig");
-
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const v8 = js.v8;
+const log = lp.log;
 const JsApis = bridge.JsApis;
 const PageJsApis = bridge.PageJsApis;
 const WorkerJsApis = bridge.WorkerJsApis;
+const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Snapshot = @This();
 
-const embedded_snapshot_blob = if (@import("build_config").snapshot_path) |path| @embedFile(path) else "";
+const embedded_snapshot_blob = if (lp.build_config.snapshot_path) |path| @embedFile(path) else "";
 
 // When creating our Snapshot, we use local function templates for every Zig type.
 // You cannot, from what I can tell, create persisted FunctionTemplates at
@@ -276,9 +276,11 @@ fn createSnapshotContext(
                 const name = JsApi.Meta.name;
                 const v8_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
                 var maybe_result: v8.MaybeBool = undefined;
-                var properties: v8.PropertyAttribute = v8.None;
-                if (@hasDecl(JsApi.Meta, "enumerable") and JsApi.Meta.enumerable == false) {
-                    properties |= v8.DontEnum;
+                // Web IDL: interface objects on the global are non-enumerable
+                // by default. Opt back in via JsApi.Meta.enumerable = true.
+                var properties: v8.PropertyAttribute = v8.DontEnum;
+                if (@hasDecl(JsApi.Meta, "enumerable") and JsApi.Meta.enumerable == true) {
+                    properties = v8.None;
                 }
                 v8.v8__Object__DefineOwnProperty(global_obj, context, v8_class_name, func, properties, &maybe_result);
             }
@@ -335,6 +337,8 @@ fn countExternalReferences() comptime_int {
     // +1 for unknownWindowPropertyCallback used on Window's global template
     count += 1;
 
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
+
     inline for (JsApis) |JsApi| {
         if (@hasDecl(JsApi, "constructor")) {
             count += 1;
@@ -349,11 +353,17 @@ fn countExternalReferences() comptime_int {
             const value = @field(JsApi, d.name);
             const T = @TypeOf(value);
             if (T == bridge.Accessor) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
                 count += 1;
                 if (value.setter != null) {
                     count += 1;
                 }
             } else if (T == bridge.Function) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
                 count += 1;
             } else if (T == bridge.Iterator) {
                 count += 1;
@@ -394,6 +404,8 @@ fn collectExternalReferences() [countExternalReferences()]isize {
     references[idx] = @bitCast(@intFromPtr(&bridge.unknownWindowPropertyCallback));
     idx += 1;
 
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
+
     inline for (JsApis) |JsApi| {
         if (@hasDecl(JsApi, "constructor")) {
             references[idx] = @bitCast(@intFromPtr(JsApi.constructor.func));
@@ -410,6 +422,10 @@ fn collectExternalReferences() [countExternalReferences()]isize {
             const value = @field(JsApi, d.name);
             const T = @TypeOf(value);
             if (T == bridge.Accessor) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
                 references[idx] = @bitCast(@intFromPtr(value.getter));
                 idx += 1;
                 if (value.setter) |setter| {
@@ -417,6 +433,9 @@ fn collectExternalReferences() [countExternalReferences()]isize {
                     idx += 1;
                 }
             } else if (T == bridge.Function) {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
                 references[idx] = @bitCast(@intFromPtr(value.func));
                 idx += 1;
             } else if (T == bridge.Iterator) {
@@ -497,7 +516,25 @@ fn countInternalFields(comptime JsApi: type) u8 {
 // Shared illegal constructor callback for types without explicit constructors
 fn illegalConstructorCallback(raw_info: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate = v8.v8__FunctionCallbackInfo__GetIsolate(raw_info);
-    log.warn(.js, "Illegal constructor call", .{});
+
+    // Recover the constructor's name via NewTarget, whose .name property was
+    // set via SetClassName when the FunctionTemplate was built. Lets us tell
+    // `new DOMException()` apart from `new MutationRecord()` in the warning.
+    var name_buf: [128]u8 = undefined;
+    var name: []const u8 = "<unknown>";
+    if (v8.v8__FunctionCallbackInfo__NewTarget(raw_info)) |new_target| {
+        if (v8.v8__Value__IsFunction(new_target)) {
+            const func: *const v8.Function = @ptrCast(new_target);
+            if (v8.v8__Function__GetName(func)) |name_value| {
+                if (v8.v8__Value__IsString(name_value)) {
+                    const str: *const v8.String = @ptrCast(name_value);
+                    const n = v8.v8__String__WriteUtf8(str, isolate, &name_buf, name_buf.len, v8.NO_NULL_TERMINATION | v8.REPLACE_INVALID_UTF8);
+                    name = name_buf[0..@intCast(n)];
+                }
+            }
+        }
+    }
+    log.info(.js, "Illegal constructor call", .{ .name = name });
 
     const message = v8.v8__String__NewFromUtf8(isolate, "Illegal Constructor", v8.kNormal, 19);
     const js_exception = v8.v8__Exception__TypeError(message);
@@ -550,7 +587,12 @@ pub fn generateConstructor(comptime JsApi: type, isolate: *v8.Isolate) *const v8
         break :blk illegalConstructorCallback;
     };
 
-    const template = v8.v8__FunctionTemplate__New__DEFAULT2(isolate, callback).?;
+    const arity: c_int = if (@hasDecl(JsApi, "constructor")) JsApi.constructor.arity else 0;
+    const template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
+        .length = arity,
+        .callback = callback,
+        .behavior = v8.kConstructorBehavior_Allow,
+    }).?;
     {
         const internal_field_count = comptime countInternalFields(JsApi);
         if (internal_field_count > 0) {
@@ -561,6 +603,8 @@ pub fn generateConstructor(comptime JsApi: type, isolate: *v8.Isolate) *const v8
     const name_str = if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi);
     const class_name = v8.v8__String__NewFromUtf8(isolate, name_str.ptr, v8.kNormal, @intCast(name_str.len));
     v8.v8__FunctionTemplate__SetClassName(template, class_name);
+    // Web IDL: interface object's `prototype` property is non-writable/non-configurable.
+    v8.v8__FunctionTemplate__ReadOnlyPrototype(template);
     return template;
 }
 
@@ -570,8 +614,16 @@ fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *const v8.F
     const prototype = v8.v8__FunctionTemplate__PrototypeTemplate(template);
     const signature = v8.v8__Signature__New(isolate, template);
 
+    // Namespace objects (e.g. console) expose their members as own properties
+    // of each instance rather than via the prototype, so Object.entries(...)
+    // returns them. See https://console.spec.whatwg.org/#console-namespace.
+    const own_properties = @hasDecl(JsApi.Meta, "own_properties") and JsApi.Meta.own_properties;
+    const member_template = if (own_properties) instance else prototype;
+
     const declarations = @typeInfo(JsApi).@"struct".decls;
     var has_named_index_getter = false;
+
+    const wpt_extensions_enabled = lp.build_config.wpt_extensions;
 
     inline for (declarations) |d| {
         const name: [:0]const u8 = d.name;
@@ -580,19 +632,32 @@ fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *const v8.F
 
         switch (definition) {
             bridge.Accessor => {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
                 const js_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
                 const getter_signature = if (value.static) null else signature;
                 const getter_callback = v8.v8__FunctionTemplate__New__Config(isolate, &.{
                     .callback = value.getter,
                     .signature = getter_signature,
                 }).?;
-                const setter_callback = if (value.setter) |setter|
-                    v8.v8__FunctionTemplate__New__Config(isolate, &.{
+                // WebIDL: getter function's .name should be "get X"
+                const getter_name_str = "get " ++ name;
+                const getter_name_v8 = v8.v8__String__NewFromUtf8(isolate, getter_name_str.ptr, v8.kNormal, @intCast(getter_name_str.len));
+                v8.v8__FunctionTemplate__SetClassName(getter_callback, getter_name_v8);
+
+                const setter_callback = if (value.setter) |setter| blk: {
+                    const cb = v8.v8__FunctionTemplate__New__Config(isolate, &.{
                         .callback = setter,
                         .signature = getter_signature,
-                    }).?
-                else
-                    null;
+                        .length = 1,
+                    }).?;
+                    const setter_name_str = "set " ++ name;
+                    const setter_name_v8 = v8.v8__String__NewFromUtf8(isolate, setter_name_str.ptr, v8.kNormal, @intCast(setter_name_str.len));
+                    v8.v8__FunctionTemplate__SetClassName(cb, setter_name_v8);
+                    break :blk cb;
+                } else null;
 
                 var attribute: v8.PropertyAttribute = 0;
                 if (value.setter == null) {
@@ -605,15 +670,20 @@ fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *const v8.F
                 if (value.static) {
                     v8.v8__Template__SetAccessorProperty(@ptrCast(template), js_name, getter_callback, setter_callback, attribute);
                 } else {
+                    const accessor_attr = if (own_properties) attribute else attribute | v8.DontEnum;
                     v8.v8__ObjectTemplate__SetAccessorProperty__Config(prototype, &.{
                         .key = js_name,
                         .getter = getter_callback,
                         .setter = setter_callback,
-                        .attribute = attribute,
+                        .attribute = accessor_attr,
                     });
                 }
             },
             bridge.Function => {
+                if (value.wpt_only and wpt_extensions_enabled == false) {
+                    continue;
+                }
+
                 // For non-static functions, use the signature to validate the receiver
                 const func_signature = if (value.static) null else signature;
                 const function_template = v8.v8__FunctionTemplate__New__Config(isolate, &.{
@@ -622,10 +692,12 @@ fn attachClass(comptime JsApi: type, isolate: *v8.Isolate, template: *const v8.F
                     .signature = func_signature,
                 }).?;
                 const js_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
-                if (value.static) {
+                v8.v8__FunctionTemplate__SetClassName(function_template, js_name);
+                if (value.static and !own_properties) {
                     v8.v8__Template__Set(@ptrCast(template), js_name, @ptrCast(function_template), v8.None);
                 } else {
-                    v8.v8__Template__Set(@ptrCast(prototype), js_name, @ptrCast(function_template), v8.None);
+                    const fn_attr: v8.PropertyAttribute = if (own_properties) v8.None else v8.DontEnum;
+                    v8.v8__Template__Set(@ptrCast(member_template), js_name, @ptrCast(function_template), fn_attr);
                 }
             },
             bridge.Indexed => {

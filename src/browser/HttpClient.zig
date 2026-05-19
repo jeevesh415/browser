@@ -17,57 +17,55 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const builtin = @import("builtin");
+
+const ArenaPool = @import("../ArenaPool.zig");
+const Notification = @import("../Notification.zig");
+const timestamp = @import("../datetime.zig").timestamp;
+
+const URL = @import("URL.zig");
+const CookieJar = @import("webapi/storage/Cookie.zig").Jar;
+
+const http = @import("../network/http.zig");
+const Robots = @import("../network/Robots.zig");
+const Network = @import("../network/Network.zig");
+
+const log = lp.log;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-
-const lp = @import("lightpanda");
-const log = lp.log;
-const URL = @import("URL.zig");
-const Config = @import("../Config.zig");
-const Notification = @import("../Notification.zig");
-const CookieJar = @import("webapi/storage/Cookie.zig").Jar;
-const WebSocket = @import("webapi/net/WebSocket.zig");
-
-const http = @import("../network/http.zig");
-const Network = @import("../network/Network.zig");
-const Robots = @import("../network/Robots.zig");
-const Cache = @import("../network/cache/Cache.zig");
-const CacheMetadata = Cache.CachedMetadata;
-const CachedResponse = Cache.CachedResponse;
-
 const IS_DEBUG = builtin.mode == .Debug;
 
 pub const Method = http.Method;
 pub const Headers = http.Headers;
 pub const ResponseHead = http.ResponseHead;
 pub const HeaderIterator = http.HeaderIterator;
+const CachedResponse = @import("../network/cache/Cache.zig").CachedResponse;
 
-// This is loosely tied to a browser Page. Loading all the <scripts>, doing
+pub const CacheLayer = @import("../network/layer/CacheLayer.zig");
+pub const RobotsLayer = @import("../network/layer/RobotsLayer.zig");
+pub const WebBotAuthLayer = @import("../network/layer/WebBotAuthLayer.zig");
+pub const InterceptionLayer = @import("../network/layer/InterceptionLayer.zig");
+
+// This is loosely tied to a browser Frame. Loading all the <scripts>, doing
 // XHR requests, and loading imports all happens through here. Sine the app
-// currently supports 1 browser and 1 page at-a-time, we only have 1 Client and
-// re-use it from page to page. This allows us better re-use of the various
+// currently supports 1 browser and 1 frame at-a-time, we only have 1 Client and
+// re-use it from frame to frame. This allows us better re-use of the various
 // buffers/caches (including keepalive connections) that libcurl has.
 //
 // The app has other secondary http needs, like telemetry. While we want to
 // share some things (namely the ca blob, and maybe some configuration
-// (TODO: ??? should proxy settings be global ???)), we're able to do call
-// client.abort() to abort the transfers being made by a page, without impacting
-// those other http requests.
+// (TODO: ??? should proxy settings be global ???)), we're able to call
+// client.abortList() to abort the transfers being made by a frame, without
+// impacting those other http requests.
 pub const Client = @This();
 
-// Count of active requests
-active: usize = 0,
+// Count of active ws requests
+ws_active: usize = 0,
 
-// Count of intercepted requests. This is to help deal with intercepted requests.
-// The client doesn't track intercepted transfers. If a request is intercepted,
-// the client forgets about it and requires the interceptor to continue or abort
-// it. That works well, except if we only rely on active, we might think there's
-// no more network activity when, with interecepted requests, there might be more
-// in the future. (We really only need this to properly emit a 'networkIdle' and
-// 'networkAlmostIdle' Page.lifecycleEvent in CDP).
-intercepted: usize = 0,
+// Count of active http requests
+http_active: usize = 0,
 
 // Our curl multi handle.
 handles: http.Handles,
@@ -84,22 +82,29 @@ performing: bool = false,
 // Use to generate the next request ID
 next_request_id: u32 = 0,
 
+// Every currently-alive Transfer indexed by its id. Maintained so cross-
+// component code (CDP intercept state, future scheduling/debugging) can
+// look up a transfer by id without holding a *Transfer that might dangle.
+// Inserted in Client.request, removed in Transfer.deinit. The pointer is
+// only valid for the lifetime of the entry.
+transfers: std.AutoHashMapUnmanaged(u32, *Transfer) = .empty,
+
 // When handles has no more available easys, requests get queued.
 queue: std.DoublyLinkedList = .{},
+
+// Queue is for Transfers that have no connection. ready_queue is for connections
+// that were initiated when performing == true and thus need to wait until
+// performing == false before being added. I'm hoping this is temporary and that
+// we can unify the two queues. But HTTP is being changed a lot right now, and
+// I'm trying to minimize the surface area.
+ready_queue: std.DoublyLinkedList = .{},
 
 // The main app allocator
 allocator: Allocator,
 
 network: *Network,
 
-// Queue of requests that depend on a robots.txt.
-// Allows us to fetch the robots.txt just once.
-pending_robots_queue: std.StringHashMapUnmanaged(std.ArrayList(Request)) = .empty,
-
-// Once we have a handle/easy to process a request with, we create a Transfer
-// which contains the Request as well as any state we need to process the
-// request. These will come and go with each request.
-transfer_pool: std.heap.MemoryPool(Transfer),
+arena_pool: *ArenaPool,
 
 // The current proxy. CDP can change it, changeProxy(null) restores
 // from config.
@@ -125,6 +130,30 @@ cdp_client: ?CDPClient = null,
 
 max_response_size: usize,
 
+cache_layer: CacheLayer,
+robots_layer: RobotsLayer,
+web_bot_auth_layer: WebBotAuthLayer,
+interception_layer: InterceptionLayer,
+entry_layer: Layer,
+
+pub const Layer = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        request: *const fn (*anyopaque, *Transfer) anyerror!void,
+    };
+
+    pub fn request(self: Layer, transfer: *Transfer) !void {
+        return self.vtable.request(self.ptr, transfer);
+    }
+};
+
+fn layerWith(self: anytype, next: Layer) Layer {
+    self.next = next;
+    return self.layer();
+}
+
 // libcurl can monitor arbitrary sockets, this lets us use libcurl to poll
 // both HTTP data as well as messages from an CDP connection.
 // Furthermore, we have some tension between blocking scripts and request
@@ -143,48 +172,76 @@ pub const CDPClient = struct {
     blocking_read_end: *const fn (*anyopaque) bool,
 };
 
-pub fn init(allocator: Allocator, network: *Network) !*Client {
-    var transfer_pool = std.heap.MemoryPool(Transfer).init(allocator);
-    errdefer transfer_pool.deinit();
-
-    const client = try allocator.create(Client);
-    errdefer allocator.destroy(client);
-
+pub fn init(self: *Client, allocator: Allocator, network: *Network, cdp_client: ?CDPClient) !void {
     var handles = try http.Handles.init(network.config);
     errdefer handles.deinit();
 
     const http_proxy = network.config.httpProxy();
 
-    client.* = .{
+    self.* = Client{
         .handles = handles,
         .network = network,
         .allocator = allocator,
-        .transfer_pool = transfer_pool,
+        .cdp_client = cdp_client,
 
         .use_proxy = http_proxy != null,
         .http_proxy = http_proxy,
         .tls_verify = network.config.tlsVerifyHost(),
         .obey_robots = network.config.obeyRobots(),
         .max_response_size = network.config.httpMaxResponseSize() orelse std.math.maxInt(u32),
+
+        .cache_layer = .{},
+        .robots_layer = .{ .allocator = allocator, .network = network },
+        .web_bot_auth_layer = .{},
+        .interception_layer = .{},
+        .entry_layer = undefined,
+        .arena_pool = &network.app.arena_pool,
     };
 
-    return client;
+    var next = self.layer();
+
+    if (network.config.obeyRobots()) {
+        next = layerWith(&self.robots_layer, next);
+    }
+
+    if (network.config.httpCacheDir() != null) {
+        next = layerWith(&self.cache_layer, next);
+    }
+
+    if (network.config.mode == .serve) {
+        next = layerWith(&self.interception_layer, next);
+    }
+
+    if (network.config.webBotAuth() != null) {
+        next = layerWith(&self.web_bot_auth_layer, next);
+    }
+
+    self.entry_layer = next;
 }
 
 pub fn deinit(self: *Client) void {
     self.abort();
     self.handles.deinit();
 
-    self.transfer_pool.deinit();
-
-    var robots_iter = self.pending_robots_queue.iterator();
-    while (robots_iter.next()) |entry| {
-        entry.value_ptr.deinit(self.allocator);
-    }
-    self.pending_robots_queue.deinit(self.allocator);
-
     self.clearUserAgentOverride();
-    self.allocator.destroy(self);
+
+    self.robots_layer.deinit(self.allocator);
+    self.transfers.deinit(self.allocator);
+}
+
+// Look up a live transfer by its id. Returns null if the transfer has been
+// destroyed. Use this — rather than holding *Transfer across yields — for
+// any code path that's interleaved with the request lifecycle (CDP
+// continueRequest/fulfill/abort, async cleanups).
+pub fn findTransfer(self: *Client, id: u32) ?*Transfer {
+    return self.transfers.get(id);
+}
+
+pub fn layer(self: *Client) Layer {
+    return .{
+        .ptr = self,
+        .vtable = &.{ .request = _request },
+    };
 }
 
 // Set a user agent override. Both the raw UA string and the pre-formatted
@@ -220,6 +277,13 @@ pub fn setTlsVerify(self: *Client, verify: bool) !void {
         const conn: *http.Connection = @fieldParentPtr("node", node);
         try conn.setTlsVerify(verify, self.use_proxy);
     }
+
+    it = self.ready_queue.first;
+    while (it) |node| : (it = node.next) {
+        const conn: *http.Connection = @fieldParentPtr("node", node);
+        try conn.setTlsVerify(verify, self.use_proxy);
+    }
+
     self.tls_verify = verify;
 }
 
@@ -248,426 +312,239 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
 }
 
 pub fn abort(self: *Client) void {
-    self._abort(true, 0);
+    // Snapshot before killing: kill() -> deinit removes entries from
+    // self.transfers, which would invalidate a live iterator.
+    var snapshot = std.ArrayList(*Transfer).initCapacity(self.allocator, self.transfers.count()) catch @panic("OOM");
+    defer snapshot.deinit(self.allocator);
+    var it = self.transfers.valueIterator();
+    while (it.next()) |t| {
+        snapshot.appendAssumeCapacity(t.*);
+    }
+
+    for (snapshot.items) |t| {
+        t.kill();
+    }
+
+    // After the kill loop, every internal list should drain itself via
+    // each transfer's deinit:
+    //   - self.transfers : transfers.remove(self.id)
+    //   - self.queue     : unlinked if _queued is set
+    //   - self.in_use / self.ready_queue : via removeConn
+    //   - self.dirty     : drained at end of each perform; nothing left here
+    // Any non-empty list means a transfer escaped cleanup — assert so we
+    // catch the regression rather than silently leaking on next use.
+    if (comptime IS_DEBUG) {
+        std.debug.assert(self.transfers.size == 0);
+        std.debug.assert(self.queue.first == null);
+        std.debug.assert(self.in_use.first == null);
+        std.debug.assert(self.ready_queue.first == null);
+        std.debug.assert(self.dirty.first == null);
+    }
 }
 
-pub fn abortFrame(self: *Client, frame_id: u32) void {
-    self._abort(false, frame_id);
+// Kill every transfer + websocket owned by `owner`. Used when the owner
+// (Frame / WorkerGlobalScope) is being torn down. After this returns,
+// every WebSocket is fully gone; HTTP transfers that were mid-perform may
+// still be on `owner.transfers` (Transfer.kill defers their deinit), but
+// they've been unlinked from the owner list via kill()'s deferred branch
+// so the owner is free to die.
+pub fn abortOwner(self: *Client, owner: *Owner) void {
+    self.abortRequests(owner);
+    var n = owner.websockets.first;
+    while (n) |node| {
+        n = node.next;
+        const ws: *@import("webapi/net/WebSocket.zig") = @fieldParentPtr("_owner_node", node);
+        ws.kill();
+    }
+    if (comptime IS_DEBUG) {
+        std.debug.assert(owner.websockets.first == null);
+    }
 }
 
-// Written this way so that both abort and abortFrame can share the same code
-// but abort can avoid the frame_id check at comptime.
-fn _abort(self: *Client, comptime abort_all: bool, frame_id: u32) void {
-    {
-        var n = self.in_use.first;
-        while (n) |node| {
-            n = node.next;
-            const conn: *http.Connection = @fieldParentPtr("node", node);
-            switch (conn.transport) {
-                .http => |transfer| {
-                    if ((comptime abort_all) or transfer.req.frame_id == frame_id) {
-                        transfer.kill();
-                    }
-                },
-                .websocket => |ws| {
-                    if ((comptime abort_all) or ws._page._frame_id == frame_id) {
-                        ws.kill();
-                    }
-                },
-                .none => unreachable,
-            }
-        }
+// HTTP-only variant. WebSockets survive (they're cross-document by
+// design). Used by the navigation path that aborts in-flight resource
+// loads for a frame but lets its WebSockets keep running.
+pub fn abortRequests(_: *Client, owner: *Owner) void {
+    var n = owner.transfers.first;
+    while (n) |node| {
+        n = node.next;
+        const t: *Transfer = @fieldParentPtr("owner_node", node);
+        t.kill();
     }
-
-    {
-        var q = &self.queue;
-        var n = q.first;
-        while (n) |node| {
-            n = node.next;
-            const transfer: *Transfer = @fieldParentPtr("_node", node);
-            if (comptime abort_all) {
-                transfer.kill();
-            } else if (transfer.req.frame_id == frame_id) {
-                q.remove(node);
-                transfer.kill();
-            }
-        }
-    }
-
-    if (comptime abort_all) {
-        self.queue = .{};
-    }
-
-    if (comptime IS_DEBUG and abort_all) {
-        // Even after an abort_all, we could still have transfers, but, at the
-        // very least, they should all be flagged as aborted.
-        var it = self.in_use.first;
-        var leftover: usize = 0;
-        while (it) |node| : (it = node.next) {
-            const conn: *http.Connection = @fieldParentPtr("node", node);
-            switch (conn.transport) {
-                .http => |transfer| std.debug.assert(transfer.aborted),
-                .websocket => {},
-                .none => {},
-            }
-            leftover += 1;
-        }
-        std.debug.assert(self.active == leftover);
-    }
+    // owner.transfers may still have entries: Transfer.kill defers
+    // (flags `aborted` + noops callbacks) when called mid-perform and
+    // only fully deinits later via processOneMessage. The deferred-branch
+    // unlinks the node and clears Transfer.owner, so by the time the
+    // owner itself is freed, no orphan transfer points at it.
 }
 
 pub fn tick(self: *Client, timeout_ms: u32) !PerformStatus {
+    try self.drainQueue();
+    const status = try self.perform(@intCast(timeout_ms));
+    // perform/processMessages just released a batch of connections back to
+    // the pool. Drain again so queued transfers can use them this tick
+    // instead of waiting for the next runner iteration.
+    try self.drainQueue();
+    return status;
+}
+
+fn drainQueue(self: *Client) !void {
     while (self.queue.popFirst()) |queue_node| {
+        const transfer: *Transfer = @fieldParentPtr("_node", queue_node);
         const conn = self.network.getConnection() orelse {
             self.queue.prepend(queue_node);
-            break;
+            return;
         };
-
-        try self.makeRequest(conn, @fieldParentPtr("_node", queue_node));
+        // Cleared only after we've successfully obtained a connection;
+        // if we put the node back, _queued stays true.
+        transfer._queued = false;
+        try self.makeRequest(conn, transfer);
     }
-
-    return self.perform(@intCast(timeout_ms));
 }
 
-pub fn request(self: *Client, req: Request) !void {
-    if (self.obey_robots == false) {
-        return self.processRequest(req);
-    }
-
-    const robots_url = try URL.getRobotsUrl(self.allocator, req.url);
-    errdefer self.allocator.free(robots_url);
-
-    // If we have this robots cached, we can take a fast path.
-    if (self.network.robot_store.get(robots_url)) |robot_entry| {
-        defer self.allocator.free(robots_url);
-
-        switch (robot_entry) {
-            // If we have a found robots entry, we check it.
-            .present => |robots| {
-                const path = URL.getPathname(req.url);
-                if (!robots.isAllowed(path)) {
-                    req.error_callback(req.ctx, error.RobotsBlocked);
-                    return;
-                }
-            },
-            // Otherwise, we assume we won't find it again.
-            .absent => {},
-        }
-
-        return self.processRequest(req);
-    }
-    return self.fetchRobotsThenProcessRequest(robots_url, req);
+// last layer
+pub fn _request(_: *anyopaque, transfer: *Transfer) !void {
+    return transfer.client.process(transfer);
 }
 
-fn serveFromCache(req: Request, cached: *const CachedResponse) !void {
-    const response = Response.fromCached(req.ctx, cached);
-    defer switch (cached.data) {
-        .buffer => |_| {},
-        .file => |f| f.file.close(),
+// Ownership contract: from the moment this function is entered, the
+// HttpClient owns `req` — specifically `req.headers` (a curl_slist).
+// On success, transfer.deinit eventually frees it. On any failure path
+// inside this function, we free it before returning the error. Callers
+// must NOT pair `request()` with their own `errdefer headers.deinit()`
+// — that's a double-free.
+pub fn request(self: *Client, req: Request, owner: ?*Owner) !void {
+    const arena = self.arena_pool.acquire(.small, "Request.arena") catch |err| {
+        req.headers.deinit();
+        return err;
     };
 
-    if (req.start_callback) |cb| {
-        try cb(response);
+    const transfer = arena.create(Transfer) catch |err| {
+        req.headers.deinit();
+        self.arena_pool.release(arena);
+        return err;
+    };
+
+    transfer.* = .{
+        .req = req,
+        .client = self,
+        .arena = arena,
+        .id = self.incrReqId(),
+        .start_time = timestamp(.monotonic),
+        // owner is set AFTER we've actually appended to the owner list,
+        // so transfer.deinit's `if (self.owner)` branch only fires when
+        // we're truly linked. Otherwise we'd try to remove a node from
+        // a list it was never in.
+        .owner = null,
+        .owner_node = .{},
+    };
+
+    // From here, transfer owns req+arena. Any subsequent failure flows
+    // through transfer.deinit (or transfer.abort), which handles headers
+    // via req.deinit. Do NOT free headers directly past this point.
+
+    // Register for id-based lookup. putNoClobber would fail if request_id
+    // collides (i.e. we've wrapped through 2^32 requests and the old
+    // transfer is still alive — practically never).
+    self.transfers.putNoClobber(self.allocator, transfer.id, transfer) catch |err| {
+        transfer.deinit();
+        return err;
+    };
+
+    if (owner) |o| {
+        o.addTransfer(transfer);
+        transfer.owner = o;
     }
 
-    const proceed = try req.header_callback(response);
-    if (!proceed) {
-        req.error_callback(req.ctx, error.Abort);
-        return;
-    }
-
-    switch (cached.data) {
-        .buffer => |data| {
-            if (data.len > 0) {
-                try req.data_callback(response, data);
-            }
-        },
-        .file => |f| {
-            const file = f.file;
-
-            var buf: [1024]u8 = undefined;
-            var file_reader = file.reader(&buf);
-            try file_reader.seekTo(f.offset);
-            const reader = &file_reader.interface;
-
-            var read_buf: [1024]u8 = undefined;
-            var remaining = f.len;
-
-            while (remaining > 0) {
-                const read_len = @min(read_buf.len, remaining);
-                const n = try reader.readSliceShort(read_buf[0..read_len]);
-                if (n == 0) break;
-                remaining -= n;
-                try req.data_callback(response, read_buf[0..n]);
-            }
-        },
-    }
-
-    try req.done_callback(req.ctx);
-}
-
-fn processRequest(self: *Client, req: Request) !void {
-    if (self.network.cache) |*cache| {
-        if (req.method == .GET) {
-            // cache is only used to read the meta data
-            const arena = try self.network.app.arena_pool.acquire(.small, "HttpClient.cache");
-            defer self.network.app.arena_pool.release(arena);
-
-            var iter = req.headers.iterator();
-            const req_header_list = try iter.collect(arena);
-
-            if (cache.get(arena, .{
-                .url = req.url,
-                .timestamp = std.time.timestamp(),
-                .request_headers = req_header_list.items,
-            })) |cached| {
-                defer req.headers.deinit();
-                return serveFromCache(req, &cached);
-            }
+    // From this point forward, the transfer owns `req` and `arena`. If the
+    // layer chain fails before any layer commits the transfer to an external
+    // owner (queue / multi handle / pending interception), we clean up here
+    // via transfer.abort which fires error_callback and deinits.
+    self.entry_layer.request(transfer) catch |err| {
+        if (!transfer.loop_owned) {
+            transfer.abort(err);
         }
-    }
-
-    const transfer = try self.makeTransfer(req);
-
-    transfer.req.notification.dispatch(.http_request_start, &.{ .transfer = transfer });
-
-    var wait_for_interception = false;
-    transfer.req.notification.dispatch(.http_request_intercept, &.{
-        .transfer = transfer,
-        .wait_for_interception = &wait_for_interception,
-    });
-    if (wait_for_interception == false) {
-        // request not intercepted, process it normally
-        return self.process(transfer);
-    }
-
-    self.intercepted += 1;
-    if (comptime IS_DEBUG) {
-        log.debug(.http, "wait for interception", .{ .intercepted = self.intercepted });
-    }
-    transfer._intercept_state = .pending;
-
-    if (req.blocking == false) {
-        // The request was interecepted, but it isn't a blocking request, so we
-        // dont' need to block this call. The request will be unblocked
-        // asynchronously via either continueTransfer or abortTransfer
-        return;
-    }
-
-    if (try self.waitForInterceptedResponse(transfer)) {
-        return self.process(transfer);
-    }
+        return err;
+    };
 }
 
-const RobotsRequestContext = struct {
-    client: *Client,
-    req: Request,
-    robots_url: [:0]const u8,
-    buffer: std.ArrayList(u8),
-    status: u16 = 0,
+const SyncContext = struct {
+    allocator: Allocator,
+    completion: union(enum) {
+        in_progress: void,
+        done: void,
+        err: anyerror,
+        shutdown: void,
+    } = .in_progress,
 
-    pub fn deinit(self: *RobotsRequestContext) void {
-        self.client.allocator.free(self.robots_url);
-        self.buffer.deinit(self.client.allocator);
-        self.client.allocator.destroy(self);
+    status: u16 = 0,
+    body: std.ArrayList(u8),
+
+    fn headerCallback(response: Response) anyerror!bool {
+        const self: *SyncContext = @ptrCast(@alignCast(response.ctx));
+        lp.assert(response.status() != null, "HttpClient.SyncRequest.headerCallback", .{ .value = response.status() });
+        self.status = response.status().?;
+        if (response.contentLength()) |cl| {
+            try self.body.ensureTotalCapacity(self.allocator, cl);
+        }
+        return true;
+    }
+
+    fn dataCallback(response: Response, data: []const u8) anyerror!void {
+        const self: *SyncContext = @ptrCast(@alignCast(response.ctx));
+        try self.body.appendSlice(self.allocator, data);
+    }
+
+    fn doneCallback(ctx: *anyopaque) anyerror!void {
+        const self: *SyncContext = @ptrCast(@alignCast(ctx));
+        self.completion = .done;
+    }
+
+    fn errorCallback(ctx: *anyopaque, err: anyerror) void {
+        const self: *SyncContext = @ptrCast(@alignCast(ctx));
+        self.completion = .{ .err = err };
+    }
+
+    fn shutdownCallback(ctx: *anyopaque) void {
+        const self: *SyncContext = @ptrCast(@alignCast(ctx));
+        self.completion = .shutdown;
     }
 };
 
-fn fetchRobotsThenProcessRequest(self: *Client, robots_url: [:0]const u8, req: Request) !void {
-    const entry = try self.pending_robots_queue.getOrPut(self.allocator, robots_url);
+pub fn syncRequest(self: *Client, allocator: Allocator, req: Request) !SyncResponse {
+    var sync_ctx = SyncContext{ .allocator = allocator, .body = .empty };
+    errdefer sync_ctx.body.deinit(allocator);
 
-    if (!entry.found_existing) {
-        errdefer self.allocator.free(robots_url);
+    var r = req;
+    r.ctx = &sync_ctx;
+    r.header_callback = SyncContext.headerCallback;
+    r.data_callback = SyncContext.dataCallback;
+    r.done_callback = SyncContext.doneCallback;
+    r.error_callback = SyncContext.errorCallback;
+    r.shutdown_callback = SyncContext.shutdownCallback;
+    try self.request(r, null);
 
-        // If we aren't already fetching this robots,
-        // we want to create a new queue for it and add this request into it.
-        entry.value_ptr.* = .empty;
-
-        const ctx = try self.allocator.create(RobotsRequestContext);
-        errdefer self.allocator.destroy(ctx);
-        ctx.* = .{ .client = self, .req = req, .robots_url = robots_url, .buffer = .empty };
-        const headers = try self.newHeaders();
-
-        log.debug(.browser, "fetching robots.txt", .{ .robots_url = robots_url });
-        try self.processRequest(.{
-            .ctx = ctx,
-            .url = robots_url,
-            .method = .GET,
-            .headers = headers,
-            .blocking = false,
-            .page_id = req.page_id,
-            .frame_id = req.frame_id,
-            .cookie_jar = req.cookie_jar,
-            .cookie_origin = req.cookie_origin,
-            .notification = req.notification,
-            .resource_type = .fetch,
-            .header_callback = robotsHeaderCallback,
-            .data_callback = robotsDataCallback,
-            .done_callback = robotsDoneCallback,
-            .error_callback = robotsErrorCallback,
-            .shutdown_callback = robotsShutdownCallback,
-        });
-    } else {
-        // Not using our own robots URL, only using the one from the first request.
-        self.allocator.free(robots_url);
-    }
-
-    try entry.value_ptr.append(self.allocator, req);
-}
-
-fn robotsHeaderCallback(response: Response) !bool {
-    const ctx: *RobotsRequestContext = @ptrCast(@alignCast(response.ctx));
-    // Robots callbacks only happen on real live requests.
-    const transfer = response.inner.transfer;
-
-    if (transfer.response_header) |hdr| {
-        log.debug(.browser, "robots status", .{ .status = hdr.status, .robots_url = ctx.robots_url });
-        ctx.status = hdr.status;
-    }
-
-    if (transfer.getContentLength()) |cl| {
-        try ctx.buffer.ensureTotalCapacity(ctx.client.allocator, cl);
-    }
-
-    return true;
-}
-
-fn robotsDataCallback(response: Response, data: []const u8) !void {
-    const ctx: *RobotsRequestContext = @ptrCast(@alignCast(response.ctx));
-    try ctx.buffer.appendSlice(ctx.client.allocator, data);
-}
-
-fn robotsDoneCallback(ctx_ptr: *anyopaque) !void {
-    const ctx: *RobotsRequestContext = @ptrCast(@alignCast(ctx_ptr));
-    defer ctx.deinit();
-
-    var allowed = true;
-
-    switch (ctx.status) {
-        200 => {
-            if (ctx.buffer.items.len > 0) {
-                const robots: ?Robots = ctx.client.network.robot_store.robotsFromBytes(
-                    ctx.client.getUserAgent(),
-                    ctx.buffer.items,
-                ) catch blk: {
-                    log.warn(.browser, "failed to parse robots", .{ .robots_url = ctx.robots_url });
-                    // If we fail to parse, we just insert it as absent and ignore.
-                    try ctx.client.network.robot_store.putAbsent(ctx.robots_url);
-                    break :blk null;
-                };
-
-                if (robots) |r| {
-                    try ctx.client.network.robot_store.put(ctx.robots_url, r);
-                    const path = URL.getPathname(ctx.req.url);
-                    allowed = r.isAllowed(path);
+    while (sync_ctx.completion == .in_progress) {
+        const status = try self.tick(200);
+        log.debug(.http, "sync request tick", .{ .status = status });
+        switch (status) {
+            .cdp_socket => {
+                const cdp = self.cdp_client.?;
+                if (cdp.blocking_read(cdp.ctx) == false) {
+                    return error.ClientDisconnected;
                 }
-            }
-        },
-        404 => {
-            log.debug(.http, "robots not found", .{ .url = ctx.robots_url });
-            // If we get a 404, we just insert it as absent.
-            try ctx.client.network.robot_store.putAbsent(ctx.robots_url);
-        },
-        else => {
-            log.debug(.http, "unexpected status on robots", .{ .url = ctx.robots_url, .status = ctx.status });
-            // If we get an unexpected status, we just insert as absent.
-            try ctx.client.network.robot_store.putAbsent(ctx.robots_url);
-        },
-    }
-
-    var queued = ctx.client.pending_robots_queue.fetchRemove(
-        ctx.robots_url,
-    ) orelse @panic("Client.robotsDoneCallbacke empty queue");
-    defer queued.value.deinit(ctx.client.allocator);
-
-    for (queued.value.items) |queued_req| {
-        if (!allowed) {
-            log.warn(.http, "blocked by robots", .{ .url = queued_req.url });
-            queued_req.error_callback(queued_req.ctx, error.RobotsBlocked);
-        } else {
-            ctx.client.processRequest(queued_req) catch |e| {
-                queued_req.error_callback(queued_req.ctx, e);
-            };
-        }
-    }
-}
-
-fn robotsErrorCallback(ctx_ptr: *anyopaque, err: anyerror) void {
-    const ctx: *RobotsRequestContext = @ptrCast(@alignCast(ctx_ptr));
-    defer ctx.deinit();
-
-    log.warn(.http, "robots fetch failed", .{ .err = err });
-
-    var queued = ctx.client.pending_robots_queue.fetchRemove(
-        ctx.robots_url,
-    ) orelse @panic("Client.robotsErrorCallback empty queue");
-    defer queued.value.deinit(ctx.client.allocator);
-
-    // On error, allow all queued requests to proceed
-    for (queued.value.items) |queued_req| {
-        ctx.client.processRequest(queued_req) catch |e| {
-            queued_req.error_callback(queued_req.ctx, e);
-        };
-    }
-}
-
-fn robotsShutdownCallback(ctx_ptr: *anyopaque) void {
-    const ctx: *RobotsRequestContext = @ptrCast(@alignCast(ctx_ptr));
-    defer ctx.deinit();
-
-    log.debug(.http, "robots fetch shutdown", .{});
-
-    var queued = ctx.client.pending_robots_queue.fetchRemove(
-        ctx.robots_url,
-    ) orelse @panic("Client.robotsErrorCallback empty queue");
-    defer queued.value.deinit(ctx.client.allocator);
-
-    for (queued.value.items) |queued_req| {
-        if (queued_req.shutdown_callback) |shutdown_cb| {
-            shutdown_cb(queued_req.ctx);
-        }
-    }
-}
-
-fn waitForInterceptedResponse(self: *Client, transfer: *Transfer) !bool {
-    // The request was intercepted and is blocking. This is messy, but our
-    // callers, the ScriptManager -> Page, don't have a great way to stop the
-    // parser and return control to the CDP server to wait for the interception
-    // response. We have some information on the CDPClient, so we'll do the
-    // blocking here. (This is a bit of a legacy thing. Initially the Client
-    // had a 'extra_socket' that it could monitor. It was named 'extra_socket'
-    // to appear generic, but really, that 'extra_socket' was always the CDP
-    // socket. Because we already had the "extra_socket" here, it was easier to
-    // make it even more CDP- aware and turn `extra_socket: socket_t` into the
-    // current CDPClient and do the blocking here).
-    const cdp_client = self.cdp_client.?;
-    const ctx = cdp_client.ctx;
-
-    if (cdp_client.blocking_read_start(ctx) == false) {
-        return error.BlockingInterceptFailure;
-    }
-
-    defer _ = cdp_client.blocking_read_end(ctx);
-
-    while (true) {
-        if (cdp_client.blocking_read(ctx) == false) {
-            return error.BlockingInterceptFailure;
-        }
-
-        switch (transfer._intercept_state) {
-            .pending => continue, // keep waiting
-            .@"continue" => return true,
-            .abort => |err| {
-                transfer.abort(err);
-                return false;
             },
-            .fulfilled => {
-                // callbacks already called, just need to cleanups
-                transfer.deinit();
-                return false;
-            },
-            .not_intercepted => unreachable,
+            .normal => continue,
         }
+    }
+
+    switch (sync_ctx.completion) {
+        .in_progress => @panic("Impossible to be in progress here."),
+        .done, .shutdown => return .{
+            .status = sync_ctx.status,
+            .body = sync_ctx.body,
+        },
+        .err => |e| return e,
     }
 }
 
@@ -684,50 +561,8 @@ fn process(self: *Client, transfer: *Transfer) !void {
     }
 
     self.queue.append(&transfer._node);
-}
-
-// For an intercepted request
-pub fn continueTransfer(self: *Client, transfer: *Transfer) !void {
-    if (comptime IS_DEBUG) {
-        std.debug.assert(transfer._intercept_state != .not_intercepted);
-        log.debug(.http, "continue transfer", .{ .intercepted = self.intercepted });
-    }
-    self.intercepted -= 1;
-
-    if (!transfer.req.blocking) {
-        return self.process(transfer);
-    }
-    transfer._intercept_state = .@"continue";
-}
-
-// For an intercepted request
-pub fn abortTransfer(self: *Client, transfer: *Transfer) void {
-    if (comptime IS_DEBUG) {
-        std.debug.assert(transfer._intercept_state != .not_intercepted);
-        log.debug(.http, "abort transfer", .{ .intercepted = self.intercepted });
-    }
-    self.intercepted -= 1;
-
-    if (!transfer.req.blocking) {
-        transfer.abort(error.Abort);
-    }
-    transfer._intercept_state = .{ .abort = error.Abort };
-}
-
-// For an intercepted request
-pub fn fulfillTransfer(self: *Client, transfer: *Transfer, status: u16, headers: []const http.Header, body: ?[]const u8) !void {
-    if (comptime IS_DEBUG) {
-        std.debug.assert(transfer._intercept_state != .not_intercepted);
-        log.debug(.http, "filfull transfer", .{ .intercepted = self.intercepted });
-    }
-    self.intercepted -= 1;
-
-    try transfer.fulfill(status, headers, body);
-    if (!transfer.req.blocking) {
-        transfer.deinit();
-        return;
-    }
-    transfer._intercept_state = .fulfilled;
+    transfer._queued = true;
+    transfer.loop_owned = true;
 }
 
 pub fn nextReqId(self: *Client) u32 {
@@ -738,45 +573,6 @@ pub fn incrReqId(self: *Client) u32 {
     const id = self.next_request_id +% 1;
     self.next_request_id = id;
     return id;
-}
-
-fn makeTransfer(self: *Client, req: Request) !*Transfer {
-    errdefer req.headers.deinit();
-
-    const transfer = try self.transfer_pool.create();
-    errdefer self.transfer_pool.destroy(transfer);
-
-    const id = self.incrReqId();
-    transfer.* = .{
-        .arena = ArenaAllocator.init(self.allocator),
-        .id = id,
-        .url = req.url,
-        .req = req,
-        .client = self,
-    };
-    return transfer;
-}
-
-fn requestFailed(transfer: *Transfer, err: anyerror, comptime execute_callback: bool) void {
-    if (transfer._notified_fail) {
-        // we can force a failed request within a callback, which will eventually
-        // result in this being called again in the more general loop. We do this
-        // because we can raise a more specific error inside a callback in some cases
-        return;
-    }
-
-    transfer._notified_fail = true;
-
-    transfer.req.notification.dispatch(.http_request_fail, &.{
-        .transfer = transfer,
-        .err = err,
-    });
-
-    if (execute_callback) {
-        transfer.req.error_callback(transfer.req.ctx, err);
-    } else if (transfer.req.shutdown_callback) |cb| {
-        cb(transfer.req.ctx);
-    }
 }
 
 // Same restriction as changeProxy. Should be ok since this is only called on
@@ -798,31 +594,40 @@ fn makeRequest(self: *Client, conn: *http.Connection, transfer: *Transfer) anyer
         transfer._conn = conn;
         errdefer {
             transfer._conn = null;
-            transfer.deinit();
             self.releaseConn(conn);
         }
 
         try transfer.configureConn(conn);
     }
 
-    // As soon as this is called, our "perform" loop is responsible for
-    // cleaning things up. That's why the above code is in a block. If anything
-    // fails BEFORE `curl_multi_add_handle` succeeds, the we still need to do
-    // cleanup. But if things fail after `curl_multi_add_handle`, we expect
-    // perform to pickup the failure and cleanup.
+    // As soon as trackConn succeeds, the multi handle owns the transfer's
+    // lifecycle. perform/processMessages will eventually invoke completion
+    // callbacks and call transfer.deinit. We flag loop_owned so Client.request
+    // (or anyone else holding the transfer pointer) knows not to deinit it.
     self.trackConn(conn) catch |err| {
         transfer._conn = null;
-        transfer.deinit();
         return err;
     };
+    transfer.loop_owned = true;
 
     if (transfer.req.start_callback) |cb| {
         cb(Response.fromTransfer(transfer)) catch |err| {
-            transfer.deinit();
+            // We're now committed to the multi. transfer.abort fires the
+            // error_callback and tears down (removeConn handles the
+            // already-in-multi case via the dirty queue).
+            transfer.abort(err);
             return err;
         };
     }
-    _ = try self.perform(0);
+
+    // Start the request (and move along any other request). This used to call
+    // self.perform(0) but that can also execute callbacks. Normally, that
+    // wouldn't be so bad. But curl can synchronously fire callbacks for the
+    // request we JUST added, which we do not want (it results in incorrect
+    // execution).
+    self.performing = true;
+    defer self.performing = false;
+    _ = try self.handles.perform();
 }
 
 pub const PerformStatus = enum {
@@ -846,6 +651,11 @@ fn perform(self: *Client, timeout_ms: c_int) anyerror!PerformStatus {
             @panic("multi_remove_handle");
         };
         self.releaseConn(conn);
+    }
+
+    while (self.ready_queue.popFirst()) |node| {
+        const conn: *http.Connection = @fieldParentPtr("node", node);
+        try self.trackConn(conn);
     }
 
     // We're potentially going to block for a while until we get data. Process
@@ -874,9 +684,6 @@ fn perform(self: *Client, timeout_ms: c_int) anyerror!PerformStatus {
 }
 
 fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *Transfer) !bool {
-    // Detect auth challenge from response headers.
-    // Also check on RecvError: proxy may send 407 with headers before
-    // closing the connection (CONNECT tunnel not yet established).
     if (msg.err == null or msg.err.? == error.RecvError) {
         transfer.detectAuthChallenge(msg.conn);
     }
@@ -890,38 +697,16 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
             &.{ .transfer = transfer, .wait_for_interception = &wait_for_interception },
         );
         if (wait_for_interception) {
-            self.intercepted += 1;
+            self.interception_layer.intercepted += 1;
             if (comptime IS_DEBUG) {
-                log.debug(.http, "wait for auth interception", .{ .intercepted = self.intercepted });
+                log.debug(.http, "wait for auth interception", .{ .intercepted = self.interception_layer.intercepted });
             }
-            transfer._intercept_state = .pending;
 
             // Whether or not this is a blocking request, we're not going
             // to process it now. We can end the transfer, which will
             // release the easy handle back into the pool. The transfer
             // is still valid/alive (just has no handle).
             transfer.releaseConn();
-            if (!transfer.req.blocking) {
-                // In the case of an async request, we can just "forget"
-                // about this transfer until it gets updated asynchronously
-                // from some CDP command.
-                return false;
-            }
-
-            // In the case of a sync request, we need to block until we
-            // get the CDP command for handling this case.
-            if (try self.waitForInterceptedResponse(transfer)) {
-                // we've been asked to continue with the request
-                // we can't process it here, since we're already inside
-                // a process, so we need to queue it and wait for the
-                // next tick (this is why it was safe to releaseConn
-                // above, because even in the "blocking" path, we still
-                // only process it on the next tick).
-                self.queue.append(&transfer._node);
-            } else {
-                // aborted, already cleaned up
-            }
-
             return false;
         }
     }
@@ -971,11 +756,11 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
     defer transfer._performing = false;
 
     if (msg.err != null and !is_conn_close_recv) {
-        transfer.requestFailed(transfer._callback_error orelse msg.err.?, true);
+        transfer.requestFailed(transfer.res.callback_error orelse msg.err.?, true);
         return true;
     }
 
-    if (!transfer._header_done_called) {
+    if (!transfer.res.header_done_called) {
         // In case of request w/o data, we need to call the header done
         // callback now.
         const proceed = try transfer.headerDoneCallback(msg.conn);
@@ -985,16 +770,11 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
         }
     }
 
-    const body = transfer._stream_buffer.items;
+    const body = transfer.res.stream_buffer.items;
 
     // Replay buffered body through user's data_callback.
-    if (transfer._stream_buffer.items.len > 0) {
+    if (body.len > 0) {
         try transfer.req.data_callback(Response.fromTransfer(transfer), body);
-
-        transfer.req.notification.dispatch(.http_response_data, &.{
-            .data = body,
-            .transfer = transfer,
-        });
 
         if (transfer.aborted) {
             transfer.requestFailed(error.Abort, true);
@@ -1002,22 +782,11 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
         }
     }
 
-    if (transfer._pending_cache_metadata) |metadata| {
-        const cache = &self.network.cache.?;
-        cache.put(metadata.*, body) catch |err| {
-            log.warn(.cache, "cache put failed", .{ .err = err });
-        };
-    }
-
     // release conn ASAP so that it's available; some done_callbacks
     // will load more resources.
     transfer.releaseConn();
 
     try transfer.req.done_callback(transfer.req.ctx);
-
-    transfer.req.notification.dispatch(.http_request_done, &.{
-        .transfer = transfer,
-    });
 
     return true;
 }
@@ -1034,7 +803,7 @@ fn processMessages(self: *Client) !bool {
                         // Conn was removed from handles during redirect reconfiguration
                         // but not re-added. Release it directly to avoid double-remove.
                         self.in_use.remove(&c.node);
-                        self.active -= 1;
+                        self.http_active -= 1;
                         self.releaseConn(c);
                         transfer._detached_conn = null;
                     }
@@ -1046,6 +815,7 @@ fn processMessages(self: *Client) !bool {
                 }
             },
             .websocket => |ws| {
+                // ws_active will be decremented through the call to disconnected
                 if (msg.err) |err| switch (err) {
                     error.GotNothing => ws.disconnected(null),
                     else => ws.disconnected(err),
@@ -1063,26 +833,51 @@ fn processMessages(self: *Client) !bool {
 }
 
 pub fn trackConn(self: *Client, conn: *http.Connection) !void {
+    if (self.performing) {
+        conn.in_use = false;
+        self.ready_queue.append(&conn.node);
+        return;
+    }
+
     self.in_use.append(&conn.node);
+    conn.in_use = true;
     // Set private pointer so readMessage can find the Connection.
     // Must be done each time since curl_easy_reset clears it when
     // connections are returned to pool.
     conn.setPrivate(conn) catch |err| {
         self.in_use.remove(&conn.node);
+        conn.in_use = false;
         self.releaseConn(conn);
         return err;
     };
     self.handles.add(conn) catch |err| {
         self.in_use.remove(&conn.node);
+        conn.in_use = false;
         self.releaseConn(conn);
         return err;
     };
-    self.active += 1;
+
+    switch (conn.transport) {
+        .http => self.http_active += 1,
+        .websocket => self.ws_active += 1,
+        else => unreachable,
+    }
 }
 
 pub fn removeConn(self: *Client, conn: *http.Connection) void {
+    if (conn.in_use == false) {
+        self.ready_queue.remove(&conn.node);
+        self.releaseConn(conn);
+        return;
+    }
+
     self.in_use.remove(&conn.node);
-    self.active -= 1;
+    conn.in_use = false;
+    switch (conn.transport) {
+        .http => self.http_active -= 1,
+        .websocket => self.ws_active -= 1,
+        else => unreachable,
+    }
     if (self.handles.remove(conn)) {
         self.releaseConn(conn);
     } else |_| {
@@ -1097,43 +892,20 @@ fn releaseConn(self: *Client, conn: *http.Connection) void {
 }
 
 fn ensureNoActiveConnection(self: *const Client) !void {
-    if (self.active > 0) {
+    if (self.http_active > 0 or self.ws_active > 0) {
         return error.InflightConnection;
     }
 }
 
 pub const Request = struct {
-    page_id: u32,
-    frame_id: u32,
-    method: Method,
-    url: [:0]const u8,
-    headers: http.Headers,
-    body: ?[]const u8 = null,
-    cookie_jar: ?*CookieJar,
-    cookie_origin: [:0]const u8,
-    resource_type: ResourceType,
-    credentials: ?[:0]const u8 = null,
-    notification: *Notification,
-    timeout_ms: u32 = 0,
+    pub const StartCallback = *const fn (response: Response) anyerror!void;
+    pub const HeaderCallback = *const fn (response: Response) anyerror!bool;
+    pub const DataCallback = *const fn (response: Response, data: []const u8) anyerror!void;
+    pub const DoneCallback = *const fn (ctx: *anyopaque) anyerror!void;
+    pub const ErrorCallback = *const fn (ctx: *anyopaque, err: anyerror) void;
+    pub const ShutdownCallback = *const fn (ctx: *anyopaque) void;
 
-    // This is only relevant for intercepted requests. If a request is flagged
-    // as blocking AND is intercepted, then it'll be up to us to wait until
-    // we receive a response to the interception. This probably isn't ideal,
-    // but it's harder for our caller (ScriptManager) to deal with this. One
-    // reason for that is the Http Client is already a bit CDP-aware.
-    blocking: bool = false,
-
-    // arbitrary data that can be associated with this request
-    ctx: *anyopaque = undefined,
-
-    start_callback: ?*const fn (response: Response) anyerror!void = null,
-    header_callback: *const fn (response: Response) anyerror!bool,
-    data_callback: *const fn (response: Response, data: []const u8) anyerror!void,
-    done_callback: *const fn (ctx: *anyopaque) anyerror!void,
-    error_callback: *const fn (ctx: *anyopaque, err: anyerror) void,
-    shutdown_callback: ?*const fn (ctx: *anyopaque) void = null,
-
-    const ResourceType = enum {
+    pub const ResourceType = enum {
         document,
         xhr,
         script,
@@ -1152,6 +924,62 @@ pub const Request = struct {
             };
         }
     };
+
+    frame_id: u32,
+    loader_id: u32,
+    method: Method,
+    url: [:0]const u8,
+    headers: http.Headers,
+    body: ?[]const u8 = null,
+    cookie_jar: ?*CookieJar,
+    cookie_origin: [:0]const u8,
+    resource_type: ResourceType,
+    credentials: ?[:0]const u8 = null,
+    notification: *Notification,
+    timeout_ms: u32 = 0,
+    skip_robots: bool = false,
+
+    // arbitrary data that can be associated with this request
+    ctx: *anyopaque = undefined,
+
+    start_callback: ?StartCallback = null,
+    header_callback: HeaderCallback = Noop.headerCallback,
+    data_callback: DataCallback = Noop.dataCallback,
+    done_callback: DoneCallback = Noop.doneCallback,
+    error_callback: ErrorCallback = Noop.errorCallback,
+    shutdown_callback: ?ShutdownCallback = null,
+
+    pub fn getCookieString(self: *Request, arena: Allocator) !?[:0]const u8 {
+        const jar = self.cookie_jar orelse return null;
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        try jar.forRequest(self.url, &aw.writer, .{
+            .is_http = true,
+            .origin_url = self.cookie_origin,
+            .is_navigation = self.resource_type == .document,
+        });
+        const written = aw.written();
+        if (written.len == 0) return null;
+        try aw.writer.writeByte(0);
+        return written.ptr[0..written.len :0];
+    }
+
+    pub fn deinit(self: *const Request) void {
+        self.headers.deinit();
+    }
+};
+
+pub const FulfilledResponse = struct {
+    status: u16,
+    url: [:0]const u8,
+    headers: []const http.Header,
+    body: ?[]const u8,
+
+    pub fn contentType(self: *const FulfilledResponse) ?[]const u8 {
+        for (self.headers) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "content-type")) return hdr.value;
+        }
+        return null;
+    }
 };
 
 pub const Response = struct {
@@ -1159,6 +987,7 @@ pub const Response = struct {
     inner: union(enum) {
         transfer: *Transfer,
         cached: *const CachedResponse,
+        fulfilled: *const FulfilledResponse,
     },
 
     pub fn fromTransfer(transfer: *Transfer) Response {
@@ -1169,17 +998,23 @@ pub const Response = struct {
         return .{ .ctx = ctx, .inner = .{ .cached = resp } };
     }
 
+    pub fn fromFulfilled(ctx: *anyopaque, fulfilled: *const FulfilledResponse) Response {
+        return .{ .ctx = ctx, .inner = .{ .fulfilled = fulfilled } };
+    }
+
     pub fn status(self: Response) ?u16 {
         return switch (self.inner) {
-            .transfer => |t| if (t.response_header) |rh| rh.status else null,
+            .transfer => |t| if (t.res.header) |rh| rh.status else null,
             .cached => |c| c.metadata.status,
+            .fulfilled => |f| f.status,
         };
     }
 
     pub fn contentType(self: Response) ?[]const u8 {
         return switch (self.inner) {
-            .transfer => |t| if (t.response_header) |*rh| rh.contentType() else null,
+            .transfer => |t| if (t.res.header) |*rh| rh.contentType() else null,
             .cached => |c| c.metadata.content_type,
+            .fulfilled => |f| f.contentType(),
         };
     }
 
@@ -1190,20 +1025,22 @@ pub const Response = struct {
                 .buffer => |buf| @intCast(buf.len),
                 .file => |f| @intCast(f.len),
             },
+            .fulfilled => |f| if (f.body) |b| @intCast(b.len) else null,
         };
     }
 
     pub fn redirectCount(self: Response) ?u32 {
         return switch (self.inner) {
-            .transfer => |t| if (t.response_header) |rh| rh.redirect_count else null,
-            .cached => 0,
+            .transfer => |t| if (t.res.header) |rh| rh.redirect_count else null,
+            .cached, .fulfilled => 0,
         };
     }
 
     pub fn url(self: Response) [:0]const u8 {
         return switch (self.inner) {
-            .transfer => |t| t.url,
+            .transfer => |t| t.req.url,
             .cached => |c| c.metadata.url,
+            .fulfilled => |f| f.url,
         };
     }
 
@@ -1211,13 +1048,14 @@ pub const Response = struct {
         return switch (self.inner) {
             .transfer => |t| t.responseHeaderIterator(),
             .cached => |c| HeaderIterator{ .list = .{ .list = c.metadata.headers } },
+            .fulfilled => |f| HeaderIterator{ .list = .{ .list = f.headers } },
         };
     }
 
     pub fn abort(self: Response, err: anyerror) void {
         switch (self.inner) {
             .transfer => |t| t.abort(err),
-            .cached => {},
+            .cached, .fulfilled => {},
         }
     }
 
@@ -1225,28 +1063,48 @@ pub const Response = struct {
         return switch (self.inner) {
             .transfer => |t| try t.format(writer),
             .cached => |c| try c.format(writer),
+            .fulfilled => |f| try writer.print("fulfilled {s}", .{f.url}),
         };
     }
 };
 
+pub const SyncResponse = struct {
+    status: u16,
+    body: std.ArrayList(u8),
+
+    pub fn deinit(self: *SyncResponse, allocator: Allocator) void {
+        self.body.deinit(allocator);
+    }
+};
+
 pub const Transfer = struct {
-    arena: ArenaAllocator,
     id: u32 = 0,
+    arena: Allocator,
+
+    owner: ?*Owner,
+    owner_node: std.DoublyLinkedList.Node = .{},
+
+    // Latched true by the first commit point that hands the transfer off to
+    // an external owner: client.queue.append, successful trackConn, or
+    // InterceptionLayer pausing for a CDP response. Once set, Client.request's
+    // errdefer skips cleanup — whoever now owns the transfer will deinit it.
+    loop_owned: bool = false,
+
+    // True iff `_node` is currently linked in `client.queue` (waiting for a
+    // libcurl handle). Set in `Client.process` on enqueue, cleared in
+    // `Client.tick` on popFirst, and used by `Transfer.deinit` to safely
+    // unlink — `deinit` has no other way to detect queue membership, and
+    // a transfer aborted while queued (e.g. via owner-list abort) would
+    // otherwise leave a dangling `_node` in `client.queue` that the next
+    // `tick` would dereference and hand to libcurl.
+    _queued: bool = false,
+
     req: Request,
-    url: [:0]const u8,
+    res: Transfer.Response = .{},
     client: *Client,
-    // total bytes received in the response, including the response status line,
-    // the headers, and the [encoded] body.
-    bytes_received: usize = 0,
-    _pending_cache_metadata: ?*CacheMetadata = null,
 
+    start_time: u64,
     aborted: bool = false,
-
-    // We'll store the response header here
-    response_header: ?ResponseHead = null,
-
-    // track if the header callbacks done have been called.
-    _header_done_called: bool = false,
 
     _notified_fail: bool = false,
 
@@ -1263,26 +1121,9 @@ pub const Transfer = struct {
     _tries: u8 = 0,
     _performing: bool = false,
     _redirect_count: u8 = 0,
-    _skip_body: bool = false,
-    _first_data_received: bool = false,
-
-    // Buffered response body. Filled by dataCallback, consumed in processMessages.
-    _stream_buffer: std.ArrayList(u8) = .{},
-
-    // Error captured in dataCallback to be reported in processMessages.
-    _callback_error: ?anyerror = null,
 
     // for when a Transfer is queued in the client.queue
     _node: std.DoublyLinkedList.Node = .{},
-    _intercept_state: InterceptState = .not_intercepted,
-
-    const InterceptState = union(enum) {
-        not_intercepted,
-        pending,
-        @"continue",
-        abort: anyerror,
-        fulfilled,
-    };
 
     fn releaseConn(self: *Transfer) void {
         if (self._conn) |conn| {
@@ -1291,74 +1132,129 @@ pub const Transfer = struct {
         }
     }
 
-    fn deinit(self: *Transfer) void {
+    pub fn deinit(self: *Transfer) void {
         if (self._conn) |conn| {
             self.client.removeConn(conn);
             self._conn = null;
         }
 
-        self.req.headers.deinit();
-        self.arena.deinit();
-        self.client.transfer_pool.destroy(self);
-    }
-
-    pub fn abort(self: *Transfer, err: anyerror) void {
-        self.requestFailed(err, true);
-
-        if (self._performing or self.client.performing) {
-            // We're currently in a curl_multi_perform. We cannot call
-            // curl_multi_remove_handle from a curl callback. Instead, we flag
-            // this transfer and our callbacks will check for this flag.
-            self.aborted = true;
-            return;
+        // Unlink from client.queue if we were waiting for a handle.
+        // Without this, deinit'ing a queued transfer (e.g. via owner-list
+        // abort during navigation) leaves a dangling _node in the queue
+        // that the next tick would pop and hand to libcurl → UAF.
+        if (self._queued) {
+            self.client.queue.remove(&self._node);
+            self._queued = false;
         }
 
-        self.deinit();
+        // Drop the id→*Transfer index entry before freeing the memory.
+        // Any concurrent CDP lookup by id will now see this transfer as gone.
+        _ = self.client.transfers.remove(self.id);
+
+        self.req.deinit();
+        if (self.owner) |o| {
+            o.removeTransfer(self);
+        }
+        // The Transfer itself lives on this arena, so this must be last —
+        // `self` is invalid memory after release.
+        const arena_pool = self.client.arena_pool;
+        const arena = self.arena;
+        arena_pool.release(arena);
     }
 
-    pub fn terminate(self: *Transfer) void {
-        self.requestFailed(error.Shutdown, false);
-        self.deinit();
+    // Cancel this transfer with `err`. Fires error_callback once (latched
+    // via _notified_fail), then either deinits synchronously or, if we're
+    // mid-perform with a libcurl handle still in the multi, detaches and
+    // lets the natural processOneMessage flow deinit later.
+    //
+    // This is the ONE entry point external callers should use to cancel
+    // a transfer. Don't reach for kill() or requestFailed() directly —
+    // they're internal helpers.
+    pub fn abort(self: *Transfer, err: anyerror) void {
+        self.requestFailed(err, true);
+        self.detachOrDeinit();
     }
 
-    // internal, when the page is shutting down. Doesn't have the same ceremony
-    // as abort (doesn't send a notification, doesn't invoke an error callback)
+    // Owner-driven teardown: fires shutdown_callback (not error_callback)
+    // and otherwise behaves like abort. Called by Client.abortOwner /
+    // abortRequests when a Frame / WGS is being torn down.
     fn kill(self: *Transfer) void {
         if (self.req.shutdown_callback) |cb| {
             cb(self.req.ctx);
         }
-
-        if (self._performing or self.client.performing) {
-            // We're currently inside of a callback. This client, and libcurl
-            // generally don't expect a transfer to become deinitialized during
-            // a callback. We can flag the transfer as aborted (which is what
-            // we do when transfer.abort() is called in this condition) AND,
-            // since this "kill()"should prevent any future callbacks, the best
-            // we can do is null/noop them.
-            self.aborted = true;
-            self.req.start_callback = null;
-            self.req.shutdown_callback = null;
-            self.req.header_callback = Noop.headerCallback;
-            self.req.data_callback = Noop.dataCallback;
-            self.req.done_callback = Noop.doneCallback;
-            self.req.error_callback = Noop.errorCallback;
-            return;
-        }
-
-        self.deinit();
+        self.detachOrDeinit();
     }
 
-    // We can force a failed request within a callback, which will eventually
-    // result in this being called again in the more general loop. We do this
-    // because we can raise a more specific error inside a callback in some cases.
+    // Decide whether to tear down now or defer until processOneMessage
+    // eventually drains the in-flight curl handle.
+    //
+    // Two cases force deferral:
+    //   * `_performing` — processOneMessage is currently processing THIS
+    //     transfer (set/cleared around the callback chain). It will call
+    //     `transfer.deinit` itself after the chain returns; deiniting
+    //     here would double-free. Note that `_conn` is cleared partway
+    //     through this window (the "release conn ASAP" step before
+    //     done_callback fires), so we cannot rely on `_conn != null`.
+    //   * `client.performing` + we have a libcurl handle — libcurl could
+    //     still fire callbacks for us. Releasing the arena now would UAF
+    //     from inside curl.
+    //
+    // Otherwise (parked / queued / never-trackConn'd / fully drained),
+    // there is nothing left referencing this transfer and we can safely
+    // deinit inline even from inside a perform callback.
+    fn detachOrDeinit(self: *Transfer) void {
+        const must_defer = self._performing or
+            (self.client.performing and self._conn != null);
+        if (must_defer) {
+            self.detachInPerform();
+        } else {
+            self.deinit();
+        }
+    }
+
+    // Deferred-cleanup path when we can't synchronously deinit.
+    //
+    // We:
+    //   - flag `aborted` so processOneMessage's normal-completion paths
+    //     short-circuit when they next see this transfer,
+    //   - noop every user callback so libcurl naturally draining the
+    //     in-flight response can't re-enter user code,
+    //   - unlink from owner.transfers and clear `owner` so the owning
+    //     Frame/WGS can be freed while this transfer is still draining.
+    //     transfer.deinit (called later by processOneMessage) sees
+    //     `owner == null` and skips the list-remove that would otherwise
+    //     UAF against a freed list.
+    fn detachInPerform(self: *Transfer) void {
+        self.aborted = true;
+        self.req.start_callback = null;
+        self.req.shutdown_callback = null;
+        self.req.header_callback = Noop.headerCallback;
+        self.req.data_callback = Noop.dataCallback;
+        self.req.done_callback = Noop.doneCallback;
+        self.req.error_callback = Noop.errorCallback;
+        if (self.owner) |o| {
+            o.removeTransfer(self);
+            self.owner = null;
+        }
+    }
+
+    // Internal failure-notification helper. Latches via _notified_fail so
+    // multiple paths racing to report the same failure only fire one
+    // notification. Goes through transfer.req — so layer wrappers
+    // (InterceptContext, CacheContext) see the failure and can propagate
+    // it up the chain.
+    //
+    // Not part of the external API: callers cancelling a transfer should
+    // use transfer.abort(err) instead, which goes through this and also
+    // handles the deinit / detach side. The internal HttpClient flow uses
+    // this directly (from processOneMessage) because it's already paired
+    // with the natural processMessages → transfer.deinit handoff.
+    //
+    // execute_callback=true → fires error_callback. false → fires
+    // shutdown_callback (used by Frame shutdown / WGS teardown).
     fn requestFailed(self: *Transfer, err: anyerror, comptime execute_callback: bool) void {
         if (self._notified_fail) return;
         self._notified_fail = true;
-
-        self.req.notification.dispatch(.http_request_fail, &.{
-            .transfer = self,
-            .err = err,
-        });
 
         if (execute_callback) {
             self.req.error_callback(self.req.ctx, err);
@@ -1389,14 +1285,8 @@ pub const Transfer = struct {
         try conn.secretHeaders(&header_list, &client.network.config.http_headers);
         try conn.setHeaders(&header_list);
 
-        // If we have WebBotAuth, sign our request.
-        if (client.network.web_bot_auth) |*wba| {
-            const authority = URL.getHost(req.url);
-            try wba.signRequest(self.arena.allocator(), &header_list, authority);
-        }
-
         // Add cookies from cookie jar.
-        if (try self.getCookieString()) |cookies| {
+        if (try self.req.getCookieString(self.arena)) |cookies| {
             try conn.setCookies(@ptrCast(cookies.ptr));
         }
 
@@ -1418,21 +1308,19 @@ pub const Transfer = struct {
     }
 
     pub fn reset(self: *Transfer) void {
-        // Note: do NOT reset _auth_challenge here. It is needed by makeRequest
-        // to determine whether to use setProxyCredentials vs setCredentials.
+        // Note: do NOT reset _auth_challenge or _redirect_count here. They
+        // span retries — _auth_challenge tells makeRequest whether to use
+        // setProxyCredentials vs setCredentials; _redirect_count caps the
+        // total hops. The rest of the response state is per-attempt.
         self._notified_fail = false;
-        self.response_header = null;
-        self.bytes_received = 0;
         self._tries += 1;
-        self._stream_buffer.clearRetainingCapacity();
-        self._callback_error = null;
-        self._skip_body = false;
-        self._first_data_received = false;
+        self.res.stream_buffer.clearRetainingCapacity();
+        self.res = .{ .stream_buffer = self.res.stream_buffer };
     }
 
     fn buildResponseHeader(self: *Transfer, conn: *const http.Connection) !void {
         if (comptime IS_DEBUG) {
-            std.debug.assert(self.response_header == null);
+            std.debug.assert(self.res.header == null);
         }
 
         const url = try conn.getEffectiveUrl();
@@ -1442,33 +1330,19 @@ pub const Transfer = struct {
         else
             try conn.getResponseCode();
 
-        self.response_header = .{
+        self.res.header = .{
             .url = url,
             .status = status,
             .redirect_count = self._redirect_count,
         };
 
         if (conn.getResponseHeader("content-type", 0)) |ct| {
-            var hdr = &self.response_header.?;
+            var hdr = &self.res.header.?;
             const value = ct.value;
             const len = @min(value.len, ResponseHead.MAX_CONTENT_TYPE_LEN);
             hdr._content_type_len = len;
             @memcpy(hdr._content_type[0..len], value[0..len]);
         }
-    }
-
-    pub fn getCookieString(self: *Transfer) !?[:0]const u8 {
-        const jar = self.req.cookie_jar orelse return null;
-        var aw: std.Io.Writer.Allocating = .init(self.arena.allocator());
-        try jar.forRequest(self.req.url, &aw.writer, .{
-            .is_http = true,
-            .origin_url = self.req.cookie_origin,
-            .is_navigation = self.req.resource_type == .document,
-        });
-        const written = aw.written();
-        if (written.len == 0) return null;
-        try aw.writer.writeByte(0);
-        return written.ptr[0..written.len :0];
     }
 
     pub fn format(self: *Transfer, writer: *std.Io.Writer) !void {
@@ -1477,17 +1351,13 @@ pub const Transfer = struct {
     }
 
     pub fn updateURL(self: *Transfer, url: [:0]const u8) !void {
-        // for cookies
-        self.url = url;
-
-        // for the request itself
         self.req.url = url;
     }
 
     fn handleRedirect(transfer: *Transfer) !void {
         const req = &transfer.req;
         const conn = transfer._conn.?;
-        const arena = transfer.arena.allocator();
+        const arena = transfer.arena;
 
         transfer._redirect_count += 1;
         if (transfer._redirect_count > transfer.client.network.config.httpMaxRedirects()) {
@@ -1498,7 +1368,7 @@ pub const Transfer = struct {
         if (req.cookie_jar) |jar| {
             var i: usize = 0;
             while (conn.getResponseHeader("set-cookie", i)) |ct| : (i += 1) {
-                try jar.populateFromResponse(transfer.url, ct.value);
+                try jar.populateFromResponse(transfer.req.url, ct.value);
 
                 if (i >= ct.amount) {
                     break;
@@ -1511,10 +1381,30 @@ pub const Transfer = struct {
             return error.LocationNotFound;
         };
 
-        const base_url = try conn.getEffectiveUrl();
-        const url = try URL.resolve(arena, std.mem.span(base_url), location.value, .{});
-        try transfer.updateURL(url);
+        const url: [:0]const u8 = blk: {
+            if (location.value.len == 0) {
+                // Might seem silly, but URL.resovle will return location.value as-is
+                // if empty, and location.value is memory owned by libcurl.
+                break :blk "";
+            }
 
+            const base_url = try conn.getEffectiveUrl();
+            const resolved = try URL.resolve(arena, std.mem.span(base_url), location.value, .{});
+
+            // RFC 7231 §7.1.2: if the Location value has no fragment, the redirect
+            // inherits the fragment from the URI used to generate the request.
+            // URL.resolve follows RFC 3986 §5.3, which drops the base fragment when
+            // the relative ref has none, so we re-attach it here.
+            if (URL.getHash(resolved).len == 0) {
+                const original_hash = URL.getHash(transfer.req.url);
+                if (original_hash.len != 0) {
+                    break :blk try std.mem.joinZ(arena, "", &.{ resolved, original_hash });
+                }
+            }
+            break :blk resolved;
+        };
+
+        try transfer.updateURL(url);
         // 301, 302, 303 → change to GET, drop body.
         // 307, 308 → keep method and body.
         const status = try conn.getResponseCode();
@@ -1571,23 +1461,20 @@ pub const Transfer = struct {
     // before interception process.
     pub fn abortAuthChallenge(self: *Transfer) void {
         if (comptime IS_DEBUG) {
-            std.debug.assert(self._intercept_state != .not_intercepted);
-            log.debug(.http, "abort auth transfer", .{ .intercepted = self.client.intercepted });
+            log.debug(.http, "abort auth transfer", .{ .intercepted = self.client.interception_layer.intercepted });
         }
-        self.client.intercepted -= 1;
-        if (!self.req.blocking) {
-            self.abort(error.AbortAuthChallenge);
-            return;
-        }
-        self._intercept_state = .{ .abort = error.AbortAuthChallenge };
+
+        self.client.interception_layer.intercepted -= 1;
+        self.abort(error.AbortAuthChallenge);
+        return;
     }
 
     // headerDoneCallback is called once the headers have been read.
     // It can be called either on dataCallback or once the request for those
     // w/o body.
     fn headerDoneCallback(transfer: *Transfer, conn: *const http.Connection) !bool {
-        lp.assert(transfer._header_done_called == false, "Transfer.headerDoneCallback", .{});
-        defer transfer._header_done_called = true;
+        lp.assert(transfer.res.header_done_called == false, "Transfer.headerDoneCallback", .{});
+        defer transfer.res.header_done_called = true;
 
         try transfer.buildResponseHeader(conn);
 
@@ -1596,7 +1483,7 @@ pub const Transfer = struct {
             while (true) {
                 const ct = conn.getResponseHeader("set-cookie", i);
                 if (ct == null) break;
-                jar.populateFromResponse(transfer.url, ct.?.value) catch |err| {
+                jar.populateFromResponse(transfer.req.url, ct.?.value) catch |err| {
                     log.err(.http, "set cookie", .{ .err = err, .req = transfer });
                     return err;
                 };
@@ -1611,64 +1498,10 @@ pub const Transfer = struct {
             }
         }
 
-        transfer.req.notification.dispatch(.http_response_header_done, &.{
-            .transfer = transfer,
-        });
-
-        const proceed = transfer.req.header_callback(Response.fromTransfer(transfer)) catch |err| {
+        const proceed = transfer.req.header_callback(Client.Response.fromTransfer(transfer)) catch |err| {
             log.err(.http, "header_callback", .{ .err = err, .req = transfer });
             return err;
         };
-
-        if (transfer.client.network.cache != null and transfer.req.method == .GET) {
-            const rh = &transfer.response_header.?;
-            const allocator = transfer.arena.allocator();
-
-            const vary = if (conn.getResponseHeader("vary", 0)) |h| h.value else null;
-
-            const maybe_cm = try Cache.tryCache(
-                allocator,
-                std.time.timestamp(),
-                transfer.url,
-                rh.status,
-                rh.contentType(),
-                if (conn.getResponseHeader("cache-control", 0)) |h| h.value else null,
-                vary,
-                if (conn.getResponseHeader("age", 0)) |h| h.value else null,
-                conn.getResponseHeader("set-cookie", 0) != null,
-                conn.getResponseHeader("authorization", 0) != null,
-            );
-
-            if (maybe_cm) |cm| {
-                var iter = transfer.responseHeaderIterator();
-                var header_list = try iter.collect(allocator);
-                const end_of_response = header_list.items.len;
-
-                if (vary) |vary_str| {
-                    var req_it = transfer.req.headers.iterator();
-
-                    while (req_it.next()) |hdr| {
-                        var vary_iter = std.mem.splitScalar(u8, vary_str, ',');
-
-                        while (vary_iter.next()) |part| {
-                            const name = std.mem.trim(u8, part, &std.ascii.whitespace);
-                            if (std.ascii.eqlIgnoreCase(hdr.name, name)) {
-                                try header_list.append(allocator, .{
-                                    .name = try allocator.dupe(u8, hdr.name),
-                                    .value = try allocator.dupe(u8, hdr.value),
-                                });
-                            }
-                        }
-                    }
-                }
-
-                const metadata = try transfer.arena.allocator().create(CacheMetadata);
-                metadata.* = cm;
-                metadata.headers = header_list.items[0..end_of_response];
-                metadata.vary_headers = header_list.items[end_of_response..];
-                transfer._pending_cache_metadata = metadata;
-            }
-        }
 
         return proceed and transfer.aborted == false;
     }
@@ -1681,9 +1514,10 @@ pub const Transfer = struct {
 
         const conn: *http.Connection = @ptrCast(@alignCast(data));
         var transfer = conn.transport.http;
+        const res = &transfer.res;
 
-        if (!transfer._first_data_received) {
-            transfer._first_data_received = true;
+        if (!res.first_data_received) {
+            res.first_data_received = true;
 
             // Skip body for responses that will be retried (redirects, auth challenges).
             const status = conn.getResponseCode() catch |err| {
@@ -1691,31 +1525,31 @@ pub const Transfer = struct {
                 return http.writefunc_error;
             };
             if ((status >= 300 and status <= 399) or status == 401 or status == 407) {
-                transfer._skip_body = true;
+                res.skip_body = true;
                 return @intCast(chunk_len);
             }
 
             // Pre-size buffer from Content-Length.
             if (transfer.getContentLength()) |cl| {
                 if (cl > transfer.client.max_response_size) {
-                    transfer._callback_error = error.ResponseTooLarge;
+                    res.callback_error = error.ResponseTooLarge;
                     return http.writefunc_error;
                 }
-                transfer._stream_buffer.ensureTotalCapacity(transfer.arena.allocator(), cl) catch {};
+                res.stream_buffer.ensureTotalCapacity(transfer.arena, cl) catch {};
             }
         }
 
-        if (transfer._skip_body) return @intCast(chunk_len);
+        if (res.skip_body) return @intCast(chunk_len);
 
-        transfer.bytes_received += chunk_len;
-        if (transfer.bytes_received > transfer.client.max_response_size) {
-            transfer._callback_error = error.ResponseTooLarge;
+        res.bytes_received += chunk_len;
+        if (res.bytes_received > transfer.client.max_response_size) {
+            res.callback_error = error.ResponseTooLarge;
             return http.writefunc_error;
         }
 
         const chunk = buffer[0..chunk_len];
-        transfer._stream_buffer.appendSlice(transfer.arena.allocator(), chunk) catch |err| {
-            transfer._callback_error = err;
+        res.stream_buffer.appendSlice(transfer.arena, chunk) catch |err| {
+            res.callback_error = err;
             return http.writefunc_error;
         };
 
@@ -1727,64 +1561,13 @@ pub const Transfer = struct {
     }
 
     pub fn responseHeaderIterator(self: *Transfer) HeaderIterator {
-        if (self._conn) |conn| {
-            // If we have a connection, than this is a real curl request and we
-            // iterate through the header that curl maintains.
-            return .{ .curl = .{ .conn = conn } };
-        }
-        // If there's no handle, it either means this is being called before
-        // the request is even being made (which would be a bug in the code)
-        // or when a response was injected via transfer.fulfill. The injected
-        // header should be iterated, since there is no handle/easy.
-        return .{ .list = .{ .list = self.response_header.?._injected_headers } };
-    }
+        // We always have a real curl request here. We handle injection up in InterceptionLayer.
+        lp.assert(self._conn != null, "Transfer.responseHeaderIterator", .{ .value = self._conn != null });
+        const conn = self._conn.?;
 
-    pub fn fulfill(transfer: *Transfer, status: u16, headers: []const http.Header, body: ?[]const u8) !void {
-        if (transfer._conn != null) {
-            // should never happen, should have been intercepted/paused, and then
-            // either continued, aborted or fulfilled once.
-            @branchHint(.unlikely);
-            return error.RequestInProgress;
-        }
-
-        transfer._fulfill(status, headers, body) catch |err| {
-            transfer.req.error_callback(transfer.req.ctx, err);
-            return err;
-        };
-    }
-
-    fn _fulfill(transfer: *Transfer, status: u16, headers: []const http.Header, body: ?[]const u8) !void {
-        const req = &transfer.req;
-        if (req.start_callback) |cb| {
-            try cb(Response.fromTransfer(transfer));
-        }
-
-        transfer.response_header = .{
-            .status = status,
-            .url = req.url,
-            .redirect_count = 0,
-            ._injected_headers = headers,
-        };
-        for (headers) |hdr| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, "content-type")) {
-                const len = @min(hdr.value.len, ResponseHead.MAX_CONTENT_TYPE_LEN);
-                @memcpy(transfer.response_header.?._content_type[0..len], hdr.value[0..len]);
-                transfer.response_header.?._content_type_len = len;
-                break;
-            }
-        }
-
-        lp.assert(transfer._header_done_called == false, "Transfer.fulfill header_done_called", .{});
-        if (try req.header_callback(Response.fromTransfer(transfer)) == false) {
-            transfer.abort(error.Abort);
-            return;
-        }
-
-        if (body) |b| {
-            try req.data_callback(Response.fromTransfer(transfer), b);
-        }
-
-        try req.done_callback(req.ctx);
+        // If we have a connection, than this is a real curl request and we
+        // iterate through the header that curl maintains.
+        return .{ .curl = .{ .conn = conn } };
     }
 
     // This function should be called during the dataCallback. Calling it after
@@ -1806,7 +1589,7 @@ pub const Transfer = struct {
         // doneCallback. OR, maybe this is a "fulfilled" request. Let's check
         // the injected headers (if we have any).
 
-        const rh = self.response_header orelse return null;
+        const rh = self.res.header orelse return null;
         for (rh._injected_headers) |hdr| {
             if (std.ascii.eqlIgnoreCase(hdr.name, "content-length")) {
                 return hdr.value;
@@ -1815,7 +1598,43 @@ pub const Transfer = struct {
 
         return null;
     }
+
+    // Response-state owned by this transfer's currently-in-flight response.
+    // Reset on every retry (auth retry, redirect) via Transfer.reset — only
+    // the cross-retry counters (_auth_challenge, _redirect_count) live on
+    // Transfer itself. `Transfer.Response` is the on-Transfer storage; the
+    // top-level `Client.Response` is the actual Response (which is a union, e.g.
+    // for a cached response)
+    const Response = struct {
+        header: ?ResponseHead = null,
+
+        // total bytes received in the response, including the response status
+        // line, the headers, and the [encoded] body.
+        bytes_received: usize = 0,
+
+        // track if the header callbacks done have been called.
+        header_done_called: bool = false,
+
+        skip_body: bool = false,
+        first_data_received: bool = false,
+
+        // Buffered response body. Filled by dataCallback, consumed in processMessages.
+        stream_buffer: std.ArrayList(u8) = .{},
+
+        // Error captured in dataCallback to be reported in processMessages.
+        callback_error: ?anyerror = null,
+    };
 };
+
+pub fn continueTransfer(self: *Client, transfer: *Transfer) !void {
+    if (comptime IS_DEBUG) {
+        lp.assert(self.interception_layer.intercepted > 0, "HttpClient.continueTransfer", .{ .value = self.interception_layer.intercepted });
+        log.debug(.http, "continue transfer", .{ .intercepted = self.interception_layer.intercepted });
+    }
+
+    self.interception_layer.intercepted -= 1;
+    return self.process(transfer);
+}
 
 const Noop = struct {
     fn headerCallback(_: Response) !bool {
@@ -1824,4 +1643,29 @@ const Noop = struct {
     fn dataCallback(_: Response, _: []const u8) !void {}
     fn doneCallback(_: *anyopaque) !void {}
     fn errorCallback(_: *anyopaque, _: anyerror) void {}
+};
+
+// An opaque-from-the-outside handle that Frame / WorkerGlobalScope embed
+// to track the HTTP transfers + WebSockets they own.
+pub const Owner = struct {
+    transfers: std.DoublyLinkedList = .{},
+    websockets: std.DoublyLinkedList = .{},
+
+    const WebSocket = @import("webapi/net/WebSocket.zig");
+
+    pub fn addTransfer(self: *Owner, t: *Transfer) void {
+        self.transfers.append(&t.owner_node);
+    }
+
+    pub fn removeTransfer(self: *Owner, t: *Transfer) void {
+        self.transfers.remove(&t.owner_node);
+    }
+
+    pub fn addWS(self: *Owner, ws: *WebSocket) void {
+        self.websockets.append(&ws._owner_node);
+    }
+
+    pub fn removeWS(self: *Owner, ws: *WebSocket) void {
+        self.websockets.remove(&ws._owner_node);
+    }
 };

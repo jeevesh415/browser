@@ -19,7 +19,7 @@
 const std = @import("std");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
+const Frame = @import("../../Frame.zig");
 const Element = @import("../Element.zig");
 const TreeWalker = @import("../TreeWalker.zig");
 const NodeLive = @import("node_live.zig").NodeLive;
@@ -57,24 +57,28 @@ _data: union(Mode) {
     empty: void,
 },
 
-pub fn length(self: *HTMLCollection, page: *const Page) u32 {
+pub fn length(self: *HTMLCollection, frame: *const Frame) u32 {
     return switch (self._data) {
         .empty => 0,
-        inline else => |*impl| impl.length(page),
+        inline else => |*impl| impl.length(frame),
     };
 }
 
-pub fn getAtIndex(self: *HTMLCollection, index: usize, page: *const Page) ?*Element {
+pub fn getAtIndex(self: *HTMLCollection, index: usize, frame: *const Frame) ?*Element {
     return switch (self._data) {
         .empty => null,
-        inline else => |*impl| impl.getAtIndex(index, page),
+        inline else => |*impl| impl.getAtIndex(index, frame),
     };
 }
 
-pub fn getByName(self: *HTMLCollection, name: []const u8, page: *Page) ?*Element {
+pub fn getByName(self: *HTMLCollection, name: []const u8, frame: *Frame) ?*Element {
+    if (name.len == 0) {
+        return null;
+    }
+
     return switch (self._data) {
         .empty => null,
-        inline else => |*impl| impl.getByName(name, page),
+        inline else => |*impl| impl.getByName(name, frame),
     };
 }
 
@@ -146,14 +150,22 @@ pub const JsApi = struct {
 
     pub const length = bridge.accessor(HTMLCollection.length, null, .{});
     pub const @"[int]" = bridge.indexed(HTMLCollection.getAtIndex, null, .{ .null_as_undefined = true });
-    pub const @"[str]" = bridge.namedIndexed(HTMLCollection.getByName, null, null, .{ .null_as_undefined = true });
+    pub const @"[str]" = bridge.namedIndexed(struct {
+        pub fn wrap(self: *HTMLCollection, name: []const u8, frame: *Frame) !?*Element {
+            if (name.len == 0) {
+                return error.NotHandled;
+            }
+
+            return self.getByName(name, frame) orelse error.NotHandled;
+        }
+    }.wrap, null, null, .{ .null_as_undefined = true });
 
     pub const item = bridge.function(_item, .{});
-    fn _item(self: *HTMLCollection, index: i32, page: *Page) ?*Element {
+    fn _item(self: *HTMLCollection, index: i32, frame: *Frame) ?*Element {
         if (index < 0) {
             return null;
         }
-        return self.getAtIndex(@intCast(index), page);
+        return self.getAtIndex(@intCast(index), frame);
     }
 
     pub const namedItem = bridge.function(HTMLCollection.getByName, .{});

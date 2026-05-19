@@ -20,15 +20,14 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
-
 const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
-const EventTarget = @import("EventTarget.zig");
-const Node = @import("Node.zig");
-const String = @import("../../string.zig").String;
 
+const Node = @import("Node.zig");
+const EventTarget = @import("EventTarget.zig");
+
+const String = lp.String;
+const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 pub const Event = @This();
 
@@ -49,6 +48,7 @@ _event_phase: EventPhase = .none,
 _time_stamp: u64,
 _needs_retargeting: bool = false,
 _is_trusted: bool = false,
+_in_passive_listener: bool = false,
 
 // There's a period of time between creating an event and handing it off to v8
 // where things can fail. If it does fail, we need to deinit the event. The timing
@@ -72,7 +72,6 @@ pub const Type = union(enum) {
     custom_event: *@import("event/CustomEvent.zig"),
     message_event: *@import("event/MessageEvent.zig"),
     progress_event: *@import("event/ProgressEvent.zig"),
-    composition_event: *@import("event/CompositionEvent.zig"),
     navigation_current_entry_change_event: *@import("event/NavigationCurrentEntryChangeEvent.zig"),
     page_transition_event: *@import("event/PageTransitionEvent.zig"),
     pop_state_event: *@import("event/PopStateEvent.zig"),
@@ -145,13 +144,12 @@ pub fn acquireRef(self: *Event) void {
     self._rc.acquire();
 }
 
-/// Force cleanup on Session shutdown.
-pub fn deinit(self: *Event, session: *Session) void {
-    session.releaseArena(self._arena);
+pub fn deinit(self: *Event, page: *Page) void {
+    page.releaseArena(self._arena);
 }
 
-pub fn releaseRef(self: *Event, session: *Session) void {
-    self._rc.release(self, session);
+pub fn releaseRef(self: *Event, page: *Page) void {
+    self._rc.release(self, page);
 }
 
 pub fn as(self: *Event, comptime T: type) *T {
@@ -165,7 +163,6 @@ pub fn is(self: *Event, comptime T: type) ?*T {
         .custom_event => |e| return if (T == @import("event/CustomEvent.zig")) e else null,
         .message_event => |e| return if (T == @import("event/MessageEvent.zig")) e else null,
         .progress_event => |e| return if (T == @import("event/ProgressEvent.zig")) e else null,
-        .composition_event => |e| return if (T == @import("event/CompositionEvent.zig")) e else null,
         .navigation_current_entry_change_event => |e| return if (T == @import("event/NavigationCurrentEntryChangeEvent.zig")) e else null,
         .page_transition_event => |e| return if (T == @import("event/PageTransitionEvent.zig")) e else null,
         .pop_state_event => |e| return if (T == @import("event/PopStateEvent.zig")) e else null,
@@ -208,7 +205,7 @@ pub fn getCurrentTarget(self: *const Event) ?*EventTarget {
 }
 
 pub fn preventDefault(self: *Event) void {
-    if (self._cancelable) {
+    if (self._cancelable and !self._in_passive_listener) {
         self._prevent_default = true;
     }
 }
@@ -233,7 +230,7 @@ pub fn getReturnValue(self: *const Event) bool {
 pub fn setReturnValue(self: *Event, v: bool) void {
     if (!v) {
         // Setting returnValue=false is equivalent to preventDefault()
-        if (self._cancelable) {
+        if (self._cancelable and !self._in_passive_listener) {
             self._prevent_default = true;
         }
     }
@@ -267,7 +264,7 @@ pub fn getIsTrusted(self: *const Event) bool {
     return self._is_trusted;
 }
 
-pub fn composedPath(self: *Event, page: *Page) ![]const *EventTarget {
+pub fn composedPath(self: *Event, exec: *Execution) ![]const *EventTarget {
     // Return empty array if event is not being dispatched
     if (self._event_phase == .none) {
         return &.{};
@@ -332,8 +329,13 @@ pub fn composedPath(self: *Event, page: *Page) ![]const *EventTarget {
     // Add window at the end (unless we stopped at shadow boundary)
     if (!stopped_at_shadow_boundary) {
         if (path_len < path_buffer.len) {
-            path_buffer[path_len] = page.window.asEventTarget();
-            path_len += 1;
+            switch (exec.context.global) {
+                .worker => {},
+                .frame => |frame| {
+                    path_buffer[path_len] = frame.window.asEventTarget();
+                    path_len += 1;
+                },
+            }
         }
     }
 
@@ -369,7 +371,7 @@ pub fn composedPath(self: *Event, page: *Page) ![]const *EventTarget {
     const visible_path_len = if (path_len > visible_start_index) path_len - visible_start_index else 0;
 
     // Allocate and return the visible path using call_arena (short-lived)
-    const path = try page.call_arena.alloc(*EventTarget, visible_path_len);
+    const path = try exec.call_arena.alloc(*EventTarget, visible_path_len);
     @memcpy(path, path_buffer[visible_start_index..path_len]);
     return path;
 }

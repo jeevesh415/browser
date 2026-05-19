@@ -27,6 +27,7 @@ const HttpClient = @import("HttpClient.zig");
 const ArenaPool = App.ArenaPool;
 
 const Session = @import("Session.zig");
+const Page = @import("Page.zig");
 const Notification = @import("../Notification.zig");
 
 // Browser is an instance of the browser.
@@ -39,32 +40,58 @@ app: *App,
 session: ?Session,
 allocator: Allocator,
 arena_pool: *ArenaPool,
-http_client: *HttpClient,
+http_client: HttpClient,
+
+// used by sessions to allocate pages.
+page_pool: std.heap.MemoryPool(Page),
+
+// Monotonic frame-ID generator scoped to this Browser (one per CDP
+// connection). Lives here, not on Session, because CDP target IDs
+// (encoded as `FID-{d:0>10}`) must be unique for the lifetime of the
+// connection -- a Session-scoped counter would re-issue the same
+// `FID-0000000001` for every fresh BrowserContext on the connection,
+// which Playwright rejects with `Duplicate target FID-...` (issue
+// #2472).
+frame_id_gen: u32 = 0,
 
 const InitOpts = struct {
     env: js.Env.InitOpts = .{},
-    http_client: *HttpClient,
 };
 
-pub fn init(app: *App, opts: InitOpts) !Browser {
+// Allocate the next frame ID. Wrapping `+%` keeps this safe past 2^32
+// allocations on a single connection (which would take days of
+// continuous navigation; in practice we wrap the connection long
+// before that). Callers must format with `FID-{d:0>10}` to match the
+// existing CDP target-ID encoding (`src/cdp/id.zig`).
+pub fn nextFrameId(self: *Browser) u32 {
+    const id = self.frame_id_gen +% 1;
+    self.frame_id_gen = id;
+    return id;
+}
+
+pub fn init(self: *Browser, app: *App, opts: InitOpts, cdp_client: ?HttpClient.CDPClient) !void {
     const allocator = app.allocator;
 
     var env = try js.Env.init(app, opts.env);
     errdefer env.deinit();
 
-    return .{
+    self.* = .{
         .app = app,
         .env = env,
         .session = null,
         .allocator = allocator,
         .arena_pool = &app.arena_pool,
-        .http_client = opts.http_client,
+        .http_client = undefined,
+        .page_pool = std.heap.MemoryPool(Page).init(allocator),
     };
+    try self.http_client.init(allocator, &app.network, cdp_client);
 }
 
 pub fn deinit(self: *Browser) void {
     self.closeSession();
     self.env.deinit();
+    self.page_pool.deinit();
+    self.http_client.deinit();
 }
 
 pub fn newSession(self: *Browser, notification: *Notification) !*Session {
@@ -79,7 +106,6 @@ pub fn closeSession(self: *Browser) void {
     if (self.session) |*session| {
         session.deinit();
         self.session = null;
-        self.env.memoryPressureNotification(.critical);
     }
 }
 

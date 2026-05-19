@@ -17,25 +17,23 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("js.zig");
+const lp = @import("lightpanda");
 const builtin = @import("builtin");
 
-const v8 = js.v8;
-
-const App = @import("../../App.zig");
-const log = @import("../../log.zig");
-
+const js = @import("js.zig");
 const bridge = @import("bridge.zig");
 const Context = @import("Context.zig");
 const Isolate = @import("Isolate.zig");
 const Platform = @import("Platform.zig");
-const Snapshot = @import("Snapshot.zig");
 const Inspector = @import("Inspector.zig");
 
-const Page = @import("../Page.zig");
+const App = @import("../../App.zig");
+const Frame = @import("../Frame.zig");
 const Window = @import("../webapi/Window.zig");
 const WorkerGlobalScope = @import("../webapi/WorkerGlobalScope.zig");
 
+const v8 = js.v8;
+const log = lp.log;
 const JsApis = bridge.JsApis;
 const Allocator = std.mem.Allocator;
 const IS_DEBUG = builtin.mode == .Debug;
@@ -75,8 +73,8 @@ context_id: usize,
 
 // Maps origin -> shared Origin contains, for v8 values shared across
 // same-origin Contexts. There's a mismatch here between our JS model and our
-// Browser model. Origins only live as long as the root page of a session exists.
-// It would be wrong/dangerous to re-use an Origin across root page navigations.
+// Browser model. Origins only live as long as the root frame of a session exists.
+// It would be wrong/dangerous to re-use an Origin across root frame navigations.
 
 // Global handles that need to be freed on deinit
 eternal_function_templates: []v8.Eternal,
@@ -92,6 +90,11 @@ inspector: ?*Inspector,
 private_symbols: PrivateSymbols,
 
 microtask_queues_are_running: bool,
+
+// Serializes V8 calls that race with TerminateExecution (which can fire from
+// the sighandler thread). Without this, a terminate landing between the
+// IsExecutionTerminating check and PerformCheckpoint trips a V8 debug assert.
+terminate_mutex: std.Thread.Mutex = .{},
 
 pub const InitOpts = struct {
     with_inspector: bool = false,
@@ -218,8 +221,8 @@ pub const ContextParams = struct {
     debug_name: []const u8 = "Context",
 };
 
-pub fn createContext(self: *Env, page: *Page, params: ContextParams) !*Context {
-    return self._createContext(page, params);
+pub fn createContext(self: *Env, frame: *Frame, params: ContextParams) !*Context {
+    return self._createContext(frame, params);
 }
 
 pub fn createWorkerContext(self: *Env, worker: *WorkerGlobalScope, params: ContextParams) !*Context {
@@ -228,7 +231,7 @@ pub fn createWorkerContext(self: *Env, worker: *WorkerGlobalScope, params: Conte
 
 fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context {
     const T = @TypeOf(global);
-    const is_page = T == *Page;
+    const is_frame = T == *Frame;
 
     const context_arena = try self.app.arena_pool.acquire(.medium, params.debug_name);
     errdefer self.app.arena_pool.release(context_arena);
@@ -243,7 +246,7 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
     errdefer v8.v8__MicrotaskQueue__DELETE(microtask_queue);
 
     // Restore the context from the snapshot (0 = Page, 1 = Worker)
-    const snapshot_index: u32 = if (comptime is_page) 0 else 1;
+    const snapshot_index: u32 = if (comptime is_frame) 0 else 1;
     const v8_context = v8.v8__Context__FromSnapshot__Config(isolate.handle, snapshot_index, &.{
         .global_template = null,
         .global_object = null,
@@ -260,7 +263,7 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
     // Store our TAO inside the internal field of the global object. This
     // maps the v8::Object -> Zig instance.
     const tao = try params.identity_arena.create(@import("TaggedOpaque.zig"));
-    tao.* = if (comptime is_page) .{
+    tao.* = if (comptime is_frame) .{
         .value = @ptrCast(global.window),
         .prototype_chain = (&Window.JsApi.Meta.prototype_chain).ptr,
         .prototype_len = @intCast(Window.JsApi.Meta.prototype_chain.len),
@@ -276,24 +279,24 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
     const context_id = self.context_id;
     self.context_id = context_id + 1;
 
-    const session = global._session;
-    const origin = try session.getOrCreateOrigin(null);
-    errdefer session.releaseOrigin(origin);
+    const page = global._page;
+    const origin = try page.getOrCreateOrigin(null);
+    errdefer page.releaseOrigin(origin);
 
     const context = try context_arena.create(Context);
     context.* = .{
         .env = self,
-        .global = if (comptime is_page) .{ .page = global } else .{ .worker = global },
+        .global = if (comptime is_frame) .{ .frame = global } else .{ .worker = global },
         .origin = origin,
         .id = context_id,
-        .session = session,
+        .page = page,
         .isolate = isolate,
         .arena = context_arena,
         .handle = context_global,
         .templates = self.templates,
         .call_arena = params.call_arena,
         .microtask_queue = microtask_queue,
-        .script_manager = if (comptime is_page) &global._script_manager else null,
+        .script_manager = if (comptime is_frame) &global._script_manager.base else &global._script_manager,
         .scheduler = .init(context_arena),
         .identity = params.identity,
         .identity_arena = params.identity_arena,
@@ -303,6 +306,7 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
     context.execution = .{
         .url = &global.url,
         .buf = &global.buf,
+        .charset = &global.charset,
         .context = context,
         .arena = global.arena,
         .call_arena = params.call_arena,
@@ -312,7 +316,7 @@ fn _createContext(self: *Env, global: anytype, params: ContextParams) !*Context 
 
     // Register in the identity map. Multiple contexts can be created for the
     // same global (via CDP), so we only register the first one.
-    const identity_ptr = if (comptime is_page) @intFromPtr(global.window) else @intFromPtr(global);
+    const identity_ptr = if (comptime is_frame) @intFromPtr(global.window) else @intFromPtr(global);
     const gop = try params.identity.identity_map.getOrPut(params.identity_arena, identity_ptr);
     if (gop.found_existing == false) {
         var global_global: v8.Global = undefined;
@@ -361,7 +365,14 @@ pub fn destroyContext(self: *Env, context: *Context) void {
 
 pub fn runMicrotasks(self: *Env) void {
     if (self.microtask_queues_are_running == false) {
+        self.terminate_mutex.lock();
+        defer self.terminate_mutex.unlock();
+
         const v8_isolate = self.isolate.handle;
+
+        if (v8.v8__Isolate__IsExecutionTerminating(v8_isolate)) {
+            return;
+        }
 
         self.microtask_queues_are_running = true;
         defer self.microtask_queues_are_running = false;
@@ -375,12 +386,16 @@ pub fn runMicrotasks(self: *Env) void {
 }
 
 pub fn runMacrotasks(self: *Env) !void {
+    if (v8.v8__Isolate__IsExecutionTerminating(self.isolate.handle)) {
+        return;
+    }
+
     for (self.contexts[0..self.context_count]) |ctx| {
         if (comptime builtin.is_test == false) {
             // I hate this comptime check as much as you do. But we have tests
             // which rely on short execution before shutdown. In real world, it's
             // underterministic whether a timer will or won't run before the
-            // page shutsdown. But for tests, we need to run them to their end.
+            // frame shutsdown. But for tests, we need to run them to their end.
             if (ctx.scheduler.hasReadyTasks() == false) {
                 continue;
             }
@@ -482,8 +497,19 @@ pub fn dumpMemoryStats(self: *Env) void {
     , .{ stats.total_heap_size, stats.total_heap_size_executable, stats.total_physical_size, stats.total_available_size, stats.used_heap_size, stats.heap_size_limit, stats.malloced_memory, stats.external_memory, stats.peak_malloced_memory, stats.number_of_native_contexts, stats.number_of_detached_contexts, stats.total_global_handles_size, stats.used_global_handles_size, stats.does_zap_garbage });
 }
 
-pub fn terminate(self: *const Env) void {
+pub fn terminate(self: *Env) void {
+    self.terminate_mutex.lock();
+    defer self.terminate_mutex.unlock();
     v8.v8__Isolate__TerminateExecution(self.isolate.handle);
+}
+
+/// Clears a pending termination so V8 calls (e.g. those made during cleanup)
+/// don't keep tripping over the terminating-state asserts. Safe to call
+/// unconditionally; a no-op if termination wasn't pending.
+pub fn cancelTerminate(self: *Env) void {
+    self.terminate_mutex.lock();
+    defer self.terminate_mutex.unlock();
+    v8.v8__Isolate__CancelTerminateExecution(self.isolate.handle);
 }
 
 fn promiseRejectCallback(message_handle: v8.PromiseRejectMessage) callconv(.c) void {
@@ -506,11 +532,11 @@ fn promiseRejectCallback(message_handle: v8.PromiseRejectMessage) callconv(.c) v
 
     const no_handler = promise_event == v8.kPromiseRejectWithNoHandler;
     switch (ctx.global) {
-        .page => |page| {
-            page.window.unhandledPromiseRejection(no_handler, .{
+        .frame => |frame| {
+            frame.window.unhandledPromiseRejection(no_handler, .{
                 .local = &local,
                 .handle = &message_handle,
-            }, page) catch |err| {
+            }, frame) catch |err| {
                 log.warn(.browser, "unhandled rejection handler", .{ .err = err, .target = "window" });
             };
         },
@@ -558,10 +584,10 @@ const PrivateSymbols = struct {
 const testing = @import("../../testing.zig");
 test "Env: Worker context " {
     const session = testing.test_session;
-    const page = try session.createPage();
+    const frame = try session.createPage();
     defer session.removePage();
 
-    const worker = try @import("../webapi/Worker.zig").init("about:blank", &page.js.execution);
+    const worker = try @import("../webapi/Worker.zig").init("http://localhost:9582/src/browser/tests/testing.js", frame);
 
     var ls: js.Local.Scope = undefined;
     worker._worker_scope.js.localScope(&ls);
@@ -571,13 +597,13 @@ test "Env: Worker context " {
     try testing.expectEqual(true, (try ls.local.exec("typeof WorkerGlobalScope !== 'undefined'", null)).isTrue());
 }
 
-test "Env: Page context" {
+test "Env: Frame context" {
     const session = testing.test_session;
-    const page = try session.createPage();
+    const frame = try session.createPage();
     defer session.removePage();
 
-    // Page already has a context created, use it directly
-    const ctx = page.js;
+    // Frame already has a context created, use it directly
+    const ctx = frame.js;
 
     var ls: js.Local.Scope = undefined;
     ctx.localScope(&ls);

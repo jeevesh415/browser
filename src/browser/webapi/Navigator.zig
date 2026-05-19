@@ -17,27 +17,31 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const builtin = @import("builtin");
 
-const log = @import("../../log.zig");
-
 const js = @import("../js/js.zig");
-const Page = @import("../Page.zig");
+const Frame = @import("../Frame.zig");
 
 const PluginArray = @import("PluginArray.zig");
 const Permissions = @import("Permissions.zig");
 const StorageManager = @import("StorageManager.zig");
+const NavigatorUAData = @import("NavigatorUAData.zig");
+const ModelContext = @import("ModelContext.zig");
+
+const log = lp.log;
 
 const Navigator = @This();
 _pad: bool = false,
 _plugins: PluginArray = .{},
 _permissions: Permissions = .{},
 _storage: StorageManager = .{},
+_ua_data: NavigatorUAData = .{},
 
 pub const init: Navigator = .{};
 
-pub fn getUserAgent(_: *const Navigator, page: *Page) []const u8 {
-    return page._session.browser.http_client.getUserAgent();
+pub fn getUserAgent(_: *const Navigator, frame: *Frame) []const u8 {
+    return frame._session.browser.http_client.getUserAgent();
 }
 
 pub fn getLanguages(_: *const Navigator) [2][]const u8 {
@@ -71,18 +75,26 @@ pub fn getStorage(self: *Navigator) *StorageManager {
     return &self._storage;
 }
 
-pub fn getBattery(_: *const Navigator, page: *Page) !js.Promise {
-    log.info(.not_implemented, "navigator.getBattery", .{});
-    return page.js.local.?.rejectErrorPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
+pub fn getUserAgentData(self: *Navigator) *NavigatorUAData {
+    return &self._ua_data;
 }
 
-pub fn registerProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, page: *const Page) !void {
-    try validateProtocolHandlerScheme(scheme);
-    try validateProtocolHandlerURL(url, page);
+pub fn getModelContext(_: *const Navigator, frame: *Frame) *ModelContext {
+    return &frame.window._model_context;
 }
-pub fn unregisterProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, page: *const Page) !void {
+
+pub fn getBattery(_: *const Navigator, frame: *Frame) !js.Promise {
+    log.info(.not_implemented, "navigator.getBattery", .{});
+    return frame.js.local.?.rejectErrorPromise(.{ .dom_exception = .{ .err = error.NotSupported } });
+}
+
+pub fn registerProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, frame: *const Frame) !void {
     try validateProtocolHandlerScheme(scheme);
-    try validateProtocolHandlerURL(url, page);
+    try validateProtocolHandlerURL(url, frame);
+}
+pub fn unregisterProtocolHandler(_: *const Navigator, scheme: []const u8, url: [:0]const u8, frame: *const Frame) !void {
+    try validateProtocolHandlerScheme(scheme);
+    try validateProtocolHandlerURL(url, frame);
 }
 
 fn validateProtocolHandlerScheme(scheme: []const u8) !void {
@@ -135,11 +147,11 @@ fn validateProtocolHandlerScheme(scheme: []const u8) !void {
     }
 }
 
-fn validateProtocolHandlerURL(url: [:0]const u8, page: *const Page) !void {
+fn validateProtocolHandlerURL(url: [:0]const u8, frame: *const Frame) !void {
     if (std.mem.indexOf(u8, url, "%s") == null) {
         return error.SyntaxError;
     }
-    if (page.isSameOrigin(url) == false) {
+    if (frame.isSameOrigin(url) == false) {
         return error.SyntaxError;
     }
 }
@@ -181,6 +193,8 @@ pub const JsApi = struct {
     pub const getBattery = bridge.function(Navigator.getBattery, .{});
     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
     pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
+    pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
+    pub const modelContext = bridge.accessor(Navigator.getModelContext, null, .{});
 };
 
 const testing = @import("../../testing.zig");

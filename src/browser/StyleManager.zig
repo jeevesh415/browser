@@ -17,13 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 
-const log = @import("../log.zig");
-const String = @import("../string.zig").String;
-
-const Page = @import("Page.zig");
+const Frame = @import("Frame.zig");
 
 const CssParser = @import("css/Parser.zig");
+const MediaQuery = @import("css/MediaQuery.zig");
 const Element = @import("webapi/Element.zig");
 
 const Selector = @import("webapi/selector/Selector.zig");
@@ -35,6 +34,8 @@ const CSSStyleSheet = @import("webapi/css/CSSStyleSheet.zig");
 const CSSStyleProperties = @import("webapi/css/CSSStyleProperties.zig");
 const CSSStyleProperty = @import("webapi/css/CSSStyleDeclaration.zig").Property;
 
+const log = lp.log;
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 pub const VisibilityCache = std.AutoHashMapUnmanaged(*Element, bool);
@@ -45,9 +46,10 @@ pub const PointerEventsCache = std.AutoHashMapUnmanaged(*Element, bool);
 const StyleManager = @This();
 
 const Tag = Element.Tag;
+const Input = Element.Html.Input;
 const RuleList = std.MultiArrayList(VisibilityRule);
 
-page: *Page,
+frame: *Frame,
 
 arena: Allocator,
 
@@ -63,22 +65,34 @@ next_doc_order: u32 = 0,
 // When true, rules need to be rebuilt
 dirty: bool = false,
 
-pub fn init(page: *Page) !StyleManager {
+pub fn init(frame: *Frame) !StyleManager {
     return .{
-        .page = page,
-        .arena = try page.getArena(.medium, "StyleManager"),
+        .frame = frame,
+        .arena = try frame.getArena(.medium, "StyleManager"),
     };
 }
 
 pub fn deinit(self: *StyleManager) void {
-    self.page.releaseArena(self.arena);
+    self.frame.releaseArena(self.arena);
 }
+
+/// Hard cap on `@media` nesting depth. CSS Nesting allows arbitrarily-deep
+/// at-rule nesting; without a cap a hostile inline stylesheet could blow the
+/// Zig stack via mutually-recursive `applyMediaAtRule` frames. 32 is well
+/// past anything seen in the wild.
+const MAX_MEDIA_NESTING: u8 = 32;
 
 fn parseSheet(self: *StyleManager, sheet: *CSSStyleSheet) !void {
     if (sheet._css_rules) |css_rules| {
         for (css_rules._rules.items) |rule| {
-            const style_rule = rule.is(CSSStyleRule) orelse continue;
-            try self.addRule(style_rule);
+            switch (rule._type) {
+                .style => |sr| try self.addRule(sr),
+                // Re-parse the stored source so an `@media` rule inserted via
+                // `insertRule` / `replaceSync` participates in the cascade
+                // when its query matches the viewport.
+                .media => try self.applyMediaAtRule(rule._text, 0),
+                else => {},
+            }
         }
         return;
     }
@@ -88,9 +102,80 @@ fn parseSheet(self: *StyleManager, sheet: *CSSStyleSheet) !void {
         const text = try style.asNode().getTextContentAlloc(self.arena);
         var it = CssParser.parseStylesheet(text);
         while (it.next()) |parsed_rule| {
-            try self.addRawRule(parsed_rule.selector, parsed_rule.block);
+            switch (parsed_rule) {
+                .style => |s| try self.addRawRule(s.selector, s.block),
+                .at_rule => |a| {
+                    // Only `@media` participates in the cascade here. Other
+                    // at-rules (`@keyframes`, `@supports`, `@font-face`, …)
+                    // don't carry top-level declarations relevant to the
+                    // visibility filter and stay skipped as before.
+                    if (std.ascii.eqlIgnoreCase(a.keyword, "media")) {
+                        try self.applyMediaAtRule(a.text, 0);
+                    }
+                },
+            }
         }
     }
+}
+
+/// Apply an `@media` at-rule by evaluating its query against the current
+/// viewport and, if it matches, parsing the inner block as if its declarations
+/// lived at the top level. Non-matching queries silently drop the inner
+/// rules. Inline-only by design: external `<link rel="stylesheet">` is out
+/// of scope for the headless engine.
+fn applyMediaAtRule(self: *StyleManager, text: []const u8, depth: u8) !void {
+    if (depth >= MAX_MEDIA_NESTING) return;
+
+    // text shape: `@media <query> { <inner> }` for well-formed input.
+    // `CssParser.RulesIterator.consumeAtRule` always emits a span starting
+    // at `@`; for unclosed blocks it runs to EOF, so the closing `}` is
+    // located explicitly rather than assumed to be the final byte.
+
+    if (text.len < @as(usize, "@media".len) + 2) return;
+    if (!std.ascii.startsWithIgnoreCase(text, "@media")) return;
+
+    const rest = text["@media".len..];
+    // Use a comment-aware brace finder; a `/* { */` in the prelude would
+    // otherwise split the rule at the wrong place. The inner block's
+    // contents are re-parsed by CssParser below, which has its own trivia
+    // handling, so only this outer boundary needs the special-case scan.
+    const open = indexOfOpenBraceSkippingComments(rest) orelse return;
+    // Search only past the opening brace — the matching `}` lives there, and
+    // any returned position is naturally `> open` (since `rest[open] == '{'`).
+    const close = open + (std.mem.lastIndexOfScalar(u8, rest[open..], '}') orelse return);
+
+    const query = std.mem.trim(u8, rest[0..open], &std.ascii.whitespace);
+    const inner = rest[open + 1 .. close];
+
+    if (!MediaQuery.matches(query, MediaQuery.Viewport.default)) return;
+
+    var it = CssParser.parseStylesheet(inner);
+    while (it.next()) |nested_rule| {
+        switch (nested_rule) {
+            .style => |s| try self.addRawRule(s.selector, s.block),
+            .at_rule => |nested| {
+                if (std.ascii.eqlIgnoreCase(nested.keyword, "media")) {
+                    try self.applyMediaAtRule(nested.text, depth + 1);
+                }
+            },
+        }
+    }
+}
+
+/// Find the first `{` in `s` that is not inside a CSS `/* ... */` comment.
+/// An unclosed comment returns `null` (treat the whole rule as malformed).
+fn indexOfOpenBraceSkippingComments(s: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + 1 < s.len and s[i] == '/' and s[i + 1] == '*') {
+            const close = std.mem.indexOf(u8, s[i + 2 ..], "*/") orelse return null;
+            i = i + 2 + close + 2;
+            continue;
+        }
+        if (s[i] == '{') return i;
+        i += 1;
+    }
+    return null;
 }
 
 fn addRawRule(self: *StyleManager, selector_text: []const u8, block_text: []const u8) !void {
@@ -170,7 +255,7 @@ fn rebuildIfDirty(self: *StyleManager) !void {
     const tag_rules_count = self.tag_rules.count();
     const other_rules_count = self.other_rules.len;
 
-    self.page._session.arena_pool.resetRetain(self.arena);
+    self.frame._session.arena_pool.resetRetain(self.arena);
 
     self.next_doc_order = 0;
 
@@ -186,7 +271,7 @@ fn rebuildIfDirty(self: *StyleManager) !void {
     self.other_rules = .{};
     try self.other_rules.ensureTotalCapacity(self.arena, other_rules_count);
 
-    const sheets = self.page.document._style_sheets orelse return;
+    const sheets = self.frame.document._style_sheets orelse return;
     for (sheets._sheets.items) |sheet| {
         self.parseSheet(sheet) catch |err| {
             log.err(.browser, "StyleManager parseSheet", .{ .err = err });
@@ -219,7 +304,9 @@ pub fn isHidden(self: *StyleManager, el: *Element, cache: ?*VisibilityCache, opt
 
         // Store in cache
         if (cache) |c| {
-            c.put(self.page.call_arena, elem, hidden) catch {};
+            c.put(self.frame.call_arena, elem, hidden) catch |err| {
+                log.warn(.browser, "StyleManager cache", .{ .err = err, .src = "isHidden" });
+            };
         }
 
         if (hidden) {
@@ -228,6 +315,61 @@ pub fn isHidden(self: *StyleManager, el: *Element, cache: ?*VisibilityCache, opt
         current = elem.parentElement();
     }
 
+    return false;
+}
+
+/// Computed display:none for a single element (own property, no ancestor walk).
+/// Honors the UA stylesheet rules per HTML Rendering §15.3.1 "Hidden elements"
+/// via `isElementHidden`.
+pub fn hasDisplayNone(self: *StyleManager, el: *Element) bool {
+    self.rebuildIfDirty() catch return false;
+    return self.isElementHidden(el, .{});
+}
+
+/// Centralizes UA-stylesheet display:none truth so `getComputedStyle().display`
+/// (via `hasDisplayNone`) and `el.checkVisibility()` (via `isHidden`) agree.
+/// Spec: HTML Rendering §15.3.1 "Hidden elements".
+fn matchesUaDisplayNoneRule(el: *Element) bool {
+    // Tag check first: O(1) switch, exits for the ~95% of elements with
+    // ordinary tags before we touch the attribute list.
+    const tag = el.getTag();
+    if (tag.isHiddenByUaStylesheet()) return true;
+
+    if (el.hasAttributeSafe(comptime .wrap("hidden"))) return true;
+
+    // input[type="hidden" i] { display: none !important }
+    // _input_type is parsed case-insensitively at attribute-set time.
+    if (tag == .input) {
+        if (el.is(Input)) |input| {
+            if (input._input_type == .hidden) return true;
+        }
+    }
+
+    // details:not([open]) > *:not(summary) { display: none }
+    if (tag != .summary) {
+        if (el.parentElement()) |parent| {
+            if (parent.getTag() == .details and !parent.hasAttributeSafe(comptime .wrap("open"))) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/// Computed visibility:hidden for an element, considering only the `visibility`
+/// chain (walks ancestors since `visibility` inherits by default). Ignores
+/// display:none: an ancestor with display:none means the element isn't
+/// rendered, but its computed `visibility` still reflects inherited visibility.
+pub fn hasVisibilityHiddenInherited(self: *StyleManager, el: *Element) bool {
+    self.rebuildIfDirty() catch return false;
+    var current: ?*Element = el;
+    while (current) |elem| {
+        if (self.isElementHidden(elem, .{ .check_display = false, .check_visibility = true })) {
+            return true;
+        }
+        current = elem.parentElement();
+    }
     return false;
 }
 
@@ -246,16 +388,21 @@ fn isElementHidden(self: *StyleManager, el: *Element, options: CheckVisibilityOp
     var opacity_priority: u64 = 0;
 
     // Check inline styles FIRST - they use INLINE_PRIORITY so no stylesheet can beat them
-    if (getInlineStyleProperty(el, comptime .wrap("display"), self.page)) |property| {
-        if (property._value.eql(comptime .wrap("none"))) {
-            return true; // Early exit for hiding value
+    if (options.check_display) {
+        if (getInlineStyleProperty(el, comptime .wrap("display"), self.frame)) |property| {
+            if (property._value.eql(comptime .wrap("none"))) {
+                return true; // Early exit for hiding value
+            }
+            display_none = false;
+            display_priority = INLINE_PRIORITY;
         }
-        display_none = false;
+    } else {
+        // Pin to INLINE_PRIORITY so rule-matching skips display entirely.
         display_priority = INLINE_PRIORITY;
     }
 
     if (options.check_visibility) {
-        if (getInlineStyleProperty(el, comptime .wrap("visibility"), self.page)) |property| {
+        if (getInlineStyleProperty(el, comptime .wrap("visibility"), self.frame)) |property| {
             if (property._value.eql(comptime .wrap("hidden")) or property._value.eql(comptime .wrap("collapse"))) {
                 return true;
             }
@@ -270,7 +417,7 @@ fn isElementHidden(self: *StyleManager, el: *Element, options: CheckVisibilityOp
     }
 
     if (options.check_opacity) {
-        if (getInlineStyleProperty(el, comptime .wrap("opacity"), self.page)) |property| {
+        if (getInlineStyleProperty(el, comptime .wrap("opacity"), self.frame)) |property| {
             if (property._value.eql(comptime .wrap("0"))) {
                 return true;
             }
@@ -279,6 +426,16 @@ fn isElementHidden(self: *StyleManager, el: *Element, options: CheckVisibilityOp
         }
     } else {
         opacity_priority = INLINE_PRIORITY;
+    }
+
+    // UA stylesheet display:none rules (HTML Rendering §15.3.1 "Hidden elements").
+    // Skipped when an inline `display` is set so author overrides win per cascade.
+    // All UA rules are short-circuited here; the spec marks some as `!important`
+    // (`input[type=hidden]`, `noscript`) and others as normal-origin, but author
+    // CSS overriding `<script>`/`<head>`/closed-`<details>` children is rare
+    // enough that uniform treatment is acceptable.
+    if (options.check_display and display_priority != INLINE_PRIORITY) {
+        if (matchesUaDisplayNoneRule(el)) return true;
     }
 
     if (display_priority == INLINE_PRIORITY and visibility_priority == INLINE_PRIORITY and opacity_priority == INLINE_PRIORITY) {
@@ -294,7 +451,7 @@ fn isElementHidden(self: *StyleManager, el: *Element, options: CheckVisibilityOp
         opacity_zero: *?bool,
         opacity_priority: *u64,
         el: *Element,
-        page: *Page,
+        frame: *Frame,
 
         fn checkRules(ctx: @This(), rules: *const RuleList) void {
             if (ctx.display_priority.* == INLINE_PRIORITY and
@@ -321,7 +478,7 @@ fn isElementHidden(self: *StyleManager, el: *Element, options: CheckVisibilityOp
 
                 if (dominated) continue;
 
-                if (matchesSelector(ctx.el, selector, ctx.page)) {
+                if (matchesSelector(ctx.el, selector, ctx.frame)) {
                     // Update best priorities
                     if (props.display_none != null and p > ctx.display_priority.*) {
                         ctx.display_none.* = props.display_none;
@@ -347,7 +504,7 @@ fn isElementHidden(self: *StyleManager, el: *Element, options: CheckVisibilityOp
         .opacity_zero = &opacity_zero,
         .opacity_priority = &opacity_priority,
         .el = el,
-        .page = self.page,
+        .frame = self.frame,
     };
 
     if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
@@ -395,7 +552,9 @@ pub fn hasPointerEventsNone(self: *StyleManager, el: *Element, cache: ?*PointerE
         const pe_none = self.elementHasPointerEventsNone(elem);
 
         if (cache) |c| {
-            c.put(self.page.call_arena, elem, pe_none) catch {};
+            c.put(self.frame.call_arena, elem, pe_none) catch |err| {
+                log.warn(.browser, "StyleManager cache", .{ .err = err, .src = "hasPointerEventsNone" });
+            };
         }
 
         if (pe_none) {
@@ -409,10 +568,10 @@ pub fn hasPointerEventsNone(self: *StyleManager, el: *Element, cache: ?*PointerE
 
 /// Check if a single element (not ancestors) has pointer-events:none.
 fn elementHasPointerEventsNone(self: *StyleManager, el: *Element) bool {
-    const page = self.page;
+    const frame = self.frame;
 
     // Check inline style first
-    if (getInlineStyleProperty(el, .wrap("pointer-events"), page)) |property| {
+    if (getInlineStyleProperty(el, .wrap("pointer-events"), frame)) |property| {
         if (property._value.eql(comptime .wrap("none"))) {
             return true;
         }
@@ -424,7 +583,7 @@ fn elementHasPointerEventsNone(self: *StyleManager, el: *Element) bool {
 
     // Helper to check a single rule
     const checkRules = struct {
-        fn check(rules: *const RuleList, res: *?bool, current_priority: *u64, elem: *Element, p: *Page) void {
+        fn check(rules: *const RuleList, res: *?bool, current_priority: *u64, elem: *Element, p: *Frame) void {
             if (current_priority.* == INLINE_PRIORITY) return;
 
             const priorities = rules.items(.priority);
@@ -445,7 +604,7 @@ fn elementHasPointerEventsNone(self: *StyleManager, el: *Element) bool {
 
     if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
         if (self.id_rules.get(id)) |rules| {
-            checkRules(&rules, &result, &best_priority, el, page);
+            checkRules(&rules, &result, &best_priority, el, frame);
         }
     }
 
@@ -453,16 +612,16 @@ fn elementHasPointerEventsNone(self: *StyleManager, el: *Element) bool {
         var it = std.mem.tokenizeAny(u8, class_attr, &std.ascii.whitespace);
         while (it.next()) |class| {
             if (self.class_rules.get(class)) |rules| {
-                checkRules(&rules, &result, &best_priority, el, page);
+                checkRules(&rules, &result, &best_priority, el, frame);
             }
         }
     }
 
     if (self.tag_rules.get(el.getTag())) |rules| {
-        checkRules(&rules, &result, &best_priority, el, page);
+        checkRules(&rules, &result, &best_priority, el, frame);
     }
 
-    checkRules(&self.other_rules, &result, &best_priority, el, page);
+    checkRules(&self.other_rules, &result, &best_priority, el, frame);
 
     return result orelse false;
 }
@@ -656,9 +815,9 @@ fn countCompoundSpecificity(compound: Selector.Compound, ids: *u32, classes: *u3
     }
 }
 
-fn matchesSelector(el: *Element, selector: Selector.Selector, page: *Page) bool {
+fn matchesSelector(el: *Element, selector: Selector.Selector, frame: *Frame) bool {
     const node = el.asNode();
-    return SelectorList.matches(node, selector, node, page);
+    return SelectorList.matches(node, selector, node, frame);
 }
 
 const VisibilityProperties = struct {
@@ -685,15 +844,16 @@ const VisibilityRule = struct {
 };
 
 const CheckVisibilityOptions = struct {
-    check_opacity: bool = false,
+    check_display: bool = true,
     check_visibility: bool = false,
+    check_opacity: bool = false,
 };
 
 // Inline styles always win over stylesheets - use max u64 as sentinel
 const INLINE_PRIORITY: u64 = std.math.maxInt(u64);
 
-fn getInlineStyleProperty(el: *Element, property_name: String, page: *Page) ?*CSSStyleProperty {
-    const style = el.getOrCreateStyle(page) catch |err| {
+fn getInlineStyleProperty(el: *Element, property_name: String, frame: *Frame) ?*CSSStyleProperty {
+    const style = el.getOrCreateStyle(frame) catch |err| {
         log.err(.browser, "StyleManager getOrCreateStyle", .{ .err = err });
         return null;
     };

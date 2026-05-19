@@ -17,8 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("js.zig");
-const SSO = @import("../../string.zig").String;
 
 const v8 = js.v8;
 
@@ -163,6 +164,53 @@ pub fn isFloat64Array(self: Value) bool {
     return v8.v8__Value__IsFloat64Array(self.handle);
 }
 
+// A few places in the code take various types, but want a string. This is a
+// type-aware version of toString(). If you do:
+//    (new ArrayBuffer(100)).toString()
+// You'll get "[object ArrayBuffer]". But this `toStringSmart()` knows about
+// buffers, and Blobs, etc and will try to return the real underlying string
+// value. It _does_ ultimately fallback to toString() - callers should check
+// for types they _don't_ want before calling this. For example, `Response`
+// checks for null or undefined before calling this to apply specific handling
+// to those cases.
+pub fn toStringSmart(self: Value) ![]const u8 {
+    if (self.isString()) |js_str| {
+        return try js_str.toSlice();
+    }
+
+    const Blob = @import("../webapi/Blob.zig");
+    if (self.local.jsValueToZig(*Blob, self)) |blob_obj| {
+        return blob_obj._slice;
+    } else |_| {}
+
+    var byte_offset: usize = 0;
+    var byte_len: usize = undefined;
+    var array_buffer: ?*const v8.ArrayBuffer = null;
+
+    if (self.isTypedArray() or self.isArrayBufferView()) {
+        const buffer_handle: *const v8.ArrayBufferView = @ptrCast(self.handle);
+        byte_len = v8.v8__ArrayBufferView__ByteLength(buffer_handle);
+        byte_offset = v8.v8__ArrayBufferView__ByteOffset(buffer_handle);
+        array_buffer = v8.v8__ArrayBufferView__Buffer(buffer_handle);
+    } else if (self.isArrayBuffer()) {
+        array_buffer = @ptrCast(self.handle);
+        byte_len = v8.v8__ArrayBuffer__ByteLength(array_buffer);
+    } else {
+        return self.toStringSlice();
+    }
+
+    const backing_store_ptr = v8.v8__ArrayBuffer__GetBackingStore(array_buffer orelse return "");
+    if (byte_len == 0) {
+        return &[_]u8{};
+    }
+
+    const backing_store_handle = v8.std__shared_ptr__v8__BackingStore__get(&backing_store_ptr) orelse return "";
+    const data = v8.v8__BackingStore__Data(backing_store_handle) orelse return "";
+    const base = @as([*]const u8, @ptrCast(data)) + byte_offset;
+
+    return base[0..byte_len];
+}
+
 pub fn isPromise(self: Value) bool {
     return v8.v8__Value__IsPromise(self.handle);
 }
@@ -230,10 +278,10 @@ pub fn toString(self: Value) !js.String {
     return .{ .local = self.local, .handle = str_handle };
 }
 
-pub fn toSSO(self: Value, comptime global: bool) !(if (global) SSO.Global else SSO) {
+pub fn toSSO(self: Value, comptime global: bool) !(if (global) lp.String.Global else lp.String) {
     return (try self.toString()).toSSO(global);
 }
-pub fn toSSOWithAlloc(self: Value, allocator: Allocator) !SSO {
+pub fn toSSOWithAlloc(self: Value, allocator: Allocator) !lp.String {
     return (try self.toString()).toSSOWithAlloc(allocator);
 }
 
@@ -251,6 +299,25 @@ pub fn toJson(self: Value, allocator: Allocator) ![]u8 {
     const local = self.local;
     const str_handle = v8.v8__JSON__Stringify(local.handle, self.handle, null) orelse return error.JsException;
     return js.String.toSliceWithAlloc(.{ .local = local, .handle = str_handle }, allocator);
+}
+
+pub fn jsonStringify(self: Value, jws: anytype) !void {
+    const local = self.local;
+    const v = self.toJson(local.call_arena) catch return error.WriteFailed;
+    // V8's JSON::Stringify finishes by calling Object::ToString on whatever
+    // i::JsonStringify returns. For values that JSON.stringify treats as
+    // non-serializable at the top level (undefined, functions, symbols),
+    // i::JsonStringify yields the undefined sentinel, and ToString coerces
+    // it to the JS string "undefined". Writing those 9 bytes raw embeds a
+    // bare `undefined` token into the JSON stream — invalid per RFC 8259.
+    // Map that case to `null`, matching what JSON.stringify emits when an
+    // unserializable value sits in an array slot.
+    if (std.mem.eql(u8, v, "undefined")) {
+        return jws.write(null);
+    }
+    jws.beginWriteRaw() catch return error.WriteFailed;
+    jws.writer.writeAll(v) catch return error.WriteFailed;
+    jws.endWriteRaw();
 }
 
 // Throws a DataCloneError for host objects (Blob, File, etc.) that cannot be serialized.
@@ -280,12 +347,23 @@ pub fn structuredCloneTo(self: Value, target: *const js.Local) !Value {
 
         // Called by V8 to report serialization errors. The exception should already be thrown.
         fn throwDataCloneError(_: ?*anyopaque, _: ?*const v8.String) callconv(.c) void {}
+
+        // Called when V8 encounters a SharedArrayBuffer. We don't support sharing them across
+        // contexts, so throw a DataCloneError and return false. V8's WriteJSArrayBuffer calls
+        // RETURN_VALUE_IF_EXCEPTION after this, so throwing prevents the fatal FromJust call.
+        fn getSharedArrayBufferId(_: ?*anyopaque, isolate: ?*v8.Isolate, _: ?*const v8.SharedArrayBuffer, _: ?*u32) callconv(.c) bool {
+            const iso = isolate orelse return false;
+            const message = v8.v8__String__NewFromUtf8(iso, "SharedArrayBuffer cannot be cloned.", v8.kNormal, -1);
+            const error_value = v8.v8__Exception__Error(message) orelse return false;
+            _ = v8.v8__Isolate__ThrowException(iso, error_value);
+            return false;
+        }
     };
 
     const size, const data = blk: {
         const serializer = v8.v8__ValueSerializer__New(v8_isolate, &.{
             .data = null,
-            .get_shared_array_buffer_id = null,
+            .get_shared_array_buffer_id = SerializerDelegate.getSharedArrayBufferId,
             .write_host_object = SerializerDelegate.writeHostObject,
             .throw_data_clone_error = SerializerDelegate.throwDataCloneError,
         }) orelse return error.JsException;
@@ -339,7 +417,7 @@ fn _persist(self: *const Value, comptime is_global: bool) !(if (is_global) Globa
         return .{ .handle = global, .temps = {} };
     }
     try ctx.trackTemp(global);
-    return .{ .handle = global, .temps = &ctx.session.temps };
+    return .{ .handle = global, .temps = &ctx.page.temps };
 }
 
 pub fn toZig(self: Value, comptime T: type) !T {
@@ -423,4 +501,61 @@ fn G(comptime global_type: GlobalType) type {
             }
         }
     };
+}
+
+const testing = @import("../../testing.zig");
+test "Value: jsonStringify maps unserializable JS values to null" {
+    const session = testing.test_session;
+    const frame = try session.createPage();
+    defer session.removePage();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    // V8::JSON::Stringify finishes with Object::ToString on whatever
+    // i::JsonStringify returns. For values JSON.stringify treats as
+    // non-serializable at the top level (undefined, functions, symbols),
+    // i::JsonStringify yields the undefined sentinel, and ToString coerces
+    // it to the JS string "undefined". Without the jsonStringify fix, those
+    // 9 bytes get written raw and the produced JSON is invalid.
+    const Wrapper = struct { v: Value };
+    const cases = .{
+        .{ .name = "undefined", .expr = "undefined" },
+        .{ .name = "function", .expr = "(function(){})" },
+        .{ .name = "symbol", .expr = "Symbol('s')" },
+    };
+    inline for (cases) |case| {
+        const value = try ls.local.exec(case.expr, null);
+        const out = try std.json.Stringify.valueAlloc(
+            testing.allocator,
+            Wrapper{ .v = value },
+            .{},
+        );
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, "{\"v\":null}", out);
+    }
+
+    // Values that DO serialize must pass through unchanged.
+    const ok_cases = .{
+        .{ .expr = "null", .expected = "{\"v\":null}" },
+        .{ .expr = "42", .expected = "{\"v\":42}" },
+        .{ .expr = "'hi'", .expected = "{\"v\":\"hi\"}" },
+        .{ .expr = "true", .expected = "{\"v\":true}" },
+        .{ .expr = "({a:1})", .expected = "{\"v\":{\"a\":1}}" },
+        .{ .expr = "[undefined]", .expected = "{\"v\":[null]}" },
+        .{ .expr = "({x:undefined})", .expected = "{\"v\":{}}" },
+        // A string literally equal to "undefined" must keep its quotes.
+        .{ .expr = "'undefined'", .expected = "{\"v\":\"undefined\"}" },
+    };
+    inline for (ok_cases) |case| {
+        const value = try ls.local.exec(case.expr, null);
+        const out = try std.json.Stringify.valueAlloc(
+            testing.allocator,
+            Wrapper{ .v = value },
+            .{},
+        );
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, case.expected, out);
+    }
 }

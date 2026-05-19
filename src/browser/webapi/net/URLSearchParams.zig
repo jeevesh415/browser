@@ -17,15 +17,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const js = @import("../../js/js.zig");
+const lp = @import("lightpanda");
 
-const log = @import("../../../log.zig");
-const String = @import("../../../string.zig").String;
-const Allocator = std.mem.Allocator;
+const js = @import("../../js/js.zig");
 
 const FormData = @import("FormData.zig");
 const KeyValueList = @import("../KeyValueList.zig");
+
+const log = lp.log;
+const String = lp.String;
 const Execution = js.Execution;
+const Allocator = std.mem.Allocator;
 
 const URLSearchParams = @This();
 
@@ -44,14 +46,23 @@ pub fn init(opts_: ?InitOpts, exec: *const Execution) !*URLSearchParams {
         const opts = opts_ orelse break :blk .empty;
         switch (opts) {
             .query_string => |qs| break :blk try paramsFromString(arena, qs, exec.buf),
-            .form_data => |fd| break :blk try KeyValueList.copy(arena, fd._list),
+            .form_data => |fd| break :blk try fd.toKeyValueList(arena),
             .value => |js_val| {
                 // Order matters here; Array is also an Object.
                 if (js_val.isArray()) {
                     break :blk try paramsFromArray(arena, js_val.toArray());
                 }
                 if (js_val.isObject()) {
-                    // normalizer is null, so page won't be used
+                    // Per the URL spec, an iterable init (URLSearchParams,
+                    // Map, ...) should be walked via its @@iterator. We
+                    // don't have a generic iterable path yet; cover the
+                    // common case of `new URLSearchParams(otherUSP)` so
+                    // the prototype-method-leak doesn't just turn into a
+                    // silent empty querystring.
+                    if (js_val.toZig(*URLSearchParams)) |other| {
+                        break :blk try KeyValueList.copy(arena, other._params);
+                    } else |_| {}
+                    // normalizer is null, so frame won't be used
                     break :blk try KeyValueList.fromJsObject(arena, js_val.toObject(), null, exec.buf);
                 }
                 if (js_val.isString()) |js_str| {
@@ -201,7 +212,7 @@ fn paramsFromString(allocator: Allocator, input_: []const u8, buf: []u8) !KeyVal
             value = try unescape(allocator, entry[idx + 1 ..], buf);
         } else {
             name = try unescape(allocator, entry, buf);
-            value = String.init(undefined, "", .{}) catch unreachable;
+            value = comptime .wrap("");
         }
 
         // optimized, unescape returns a String directly (Because unescape may
@@ -217,7 +228,7 @@ fn paramsFromString(allocator: Allocator, input_: []const u8, buf: []u8) !KeyVal
 
 fn unescape(arena: Allocator, value: []const u8, buf: []u8) !String {
     if (value.len == 0) {
-        return String.init(undefined, "", .{});
+        return comptime .wrap("");
     }
 
     var has_plus = false;

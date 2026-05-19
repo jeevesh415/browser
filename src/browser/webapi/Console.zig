@@ -17,9 +17,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const js = @import("../js/js.zig");
 
-const logger = @import("../../log.zig");
+const Notification = @import("../../Notification.zig");
+const datetime = @import("../../datetime.zig");
+
+const logger = lp.log;
+const LogLevel = lp.log.Level;
 
 const Console = @This();
 
@@ -28,27 +33,51 @@ _counts: std.StringHashMapUnmanaged(u64) = .{},
 
 pub const init: Console = .{};
 
+fn dispatchConsoleMessage(values: []js.Value, console_type: Notification.ConsoleMessageType, exec: *js.Execution) void {
+    const notification = exec.context.page.session.notification;
+    const ts = datetime.timestamp(.monotonic);
+
+    notification.dispatch(.console_message, &.{
+        .source = .javascript,
+        .type = console_type,
+        .values = values,
+        .timestamp = ts,
+    });
+
+    notification.dispatch(.runtime_console_message, &.{
+        .source = .javascript,
+        .type = console_type,
+        .values = values,
+        .timestamp = ts,
+    });
+}
+
 pub fn trace(_: *const Console, values: []js.Value, exec: *js.Execution) !void {
     logger.debug(.js, "console.trace", .{
         .stack = exec.context.local.?.stackTrace() catch "???",
         .args = ValueWriter{ .values = values },
     });
+    dispatchConsoleMessage(values, .trace, exec);
 }
 
-pub fn debug(_: *const Console, values: []js.Value) void {
+pub fn debug(_: *const Console, values: []js.Value, exec: *js.Execution) void {
     logger.debug(.js, "console.debug", .{ValueWriter{ .values = values }});
+    dispatchConsoleMessage(values, .debug, exec);
 }
 
-pub fn info(_: *const Console, values: []js.Value) void {
+pub fn info(_: *const Console, values: []js.Value, exec: *js.Execution) void {
     logger.info(.js, "console.info", .{ValueWriter{ .values = values }});
+    dispatchConsoleMessage(values, .info, exec);
 }
 
-pub fn log(_: *const Console, values: []js.Value) void {
+pub fn log(_: *const Console, values: []js.Value, exec: *js.Execution) void {
     logger.info(.js, "console.log", .{ValueWriter{ .values = values }});
+    dispatchConsoleMessage(values, .info, exec);
 }
 
-pub fn warn(_: *const Console, values: []js.Value) void {
+pub fn warn(_: *const Console, values: []js.Value, exec: *js.Execution) void {
     logger.warn(.js, "console.warn", .{ValueWriter{ .values = values }});
+    dispatchConsoleMessage(values, .info, exec);
 }
 
 pub fn clear(_: *const Console) void {}
@@ -62,6 +91,7 @@ pub fn assert(_: *const Console, assertion: js.Value, values: []js.Value) void {
 
 pub fn @"error"(_: *const Console, values: []js.Value, exec: *js.Execution) void {
     logger.warn(.js, "console.error", .{ValueWriter{ .values = values, .stack = exec.context.local.?.stackTrace() catch |err| @errorName(err) orelse "???" }});
+    dispatchConsoleMessage(values, .@"error", exec);
 }
 
 pub fn table(_: *const Console, data: js.Value, columns: ?js.Value) void {
@@ -176,6 +206,10 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Console";
+
+        // Per the console spec, members are own properties of the namespace
+        // object, so Object.entries(console) returns them.
+        pub const own_properties = true;
 
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;

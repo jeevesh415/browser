@@ -18,51 +18,49 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const log = @import("../../log.zig");
 
 const js = @import("js.zig");
-const bridge = @import("bridge.zig");
 const Env = @import("Env.zig");
 const Origin = @import("Origin.zig");
 const Scheduler = @import("Scheduler.zig");
 const Execution = @import("Execution.zig");
 
+const Frame = @import("../Frame.zig");
 const Page = @import("../Page.zig");
 const Session = @import("../Session.zig");
-const ScriptManager = @import("../ScriptManager.zig");
+const ScriptManagerBase = @import("../ScriptManagerBase.zig");
 const WorkerGlobalScope = @import("../webapi/WorkerGlobalScope.zig");
 
 const v8 = js.v8;
+const log = lp.log;
 const Caller = js.Caller;
-
 const Allocator = std.mem.Allocator;
-
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
 // Loosely maps to a Browser Page or Worker.
 const Context = @This();
 
 pub const GlobalScope = union(enum) {
-    page: *Page,
+    frame: *Frame,
     worker: *WorkerGlobalScope,
 
     pub fn base(self: GlobalScope) [:0]const u8 {
         return switch (self) {
-            .page => |page| page.base(),
+            .frame => |frame| frame.base(),
             .worker => |worker| worker.base(),
         };
     }
 
     pub fn getJs(self: GlobalScope) *Context {
         return switch (self) {
-            .page => |page| page.js,
+            .frame => |frame| frame.js,
             .worker => |worker| worker.js,
         };
     }
 
     pub fn setJs(self: GlobalScope, ctx: *Context) void {
         switch (self) {
-            .page => |page| page.js = ctx,
+            .frame => |frame| frame.js = ctx,
             .worker => |worker| worker.js = ctx,
         }
     }
@@ -71,7 +69,14 @@ pub const GlobalScope = union(enum) {
 id: usize,
 env: *Env,
 global: GlobalScope,
-session: *Session,
+
+// The Page this Context belongs to. For main-world frame contexts, this is
+// the Page of the frame. For worker contexts, this is the Page of the
+// worker's parent frame — a worker's v8 globals and identity tracking live
+// on the same Page as its owning frame (worker dies with its page). The
+// Session is always reachable via `page.session`.
+page: *Page,
+
 isolate: js.Isolate,
 
 // Per-context microtask queue for isolation between contexts
@@ -92,7 +97,7 @@ templates: []*const v8.FunctionTemplate,
 arena: Allocator,
 
 // The call_arena for this context. For main world contexts this is
-// page.call_arena. For isolated world contexts this is a separate arena
+// frame.call_arena. For isolated world contexts this is a separate arena
 // owned by the IsolatedWorld.
 call_arena: Allocator,
 
@@ -116,7 +121,7 @@ origin: *Origin,
 identity: *js.Identity,
 
 // Allocator to use for identity map operations. For main world contexts this is
-// session.page_arena, for isolated worlds it's the isolated world's arena.
+// page.frame_arena, for isolated worlds it's the isolated world's arena.
 identity_arena: Allocator,
 
 // Unlike other v8 types, like functions or objects, modules are not shared
@@ -133,8 +138,9 @@ module_cache: std.StringHashMapUnmanaged(ModuleEntry) = .empty,
 // necessary to lookup/store the dependent module in the module_cache.
 module_identifier: std.AutoHashMapUnmanaged(u32, [:0]const u8) = .empty,
 
-// the page's script manager
-script_manager: ?*ScriptManager,
+// Module-loading plumbing. Frame contexts point at the ScriptManager's
+// embedded Base; worker contexts point at WorkerGlobalScope's Base directly.
+script_manager: *ScriptManagerBase,
 
 // Our macrotasks
 scheduler: Scheduler,
@@ -209,7 +215,7 @@ pub fn deinit(self: *Context) void {
         v8.v8__Global__Reset(global);
     }
 
-    self.session.releaseOrigin(self.origin);
+    self.page.releaseOrigin(self.origin);
 
     // Clear the embedder data so that if V8 keeps this context alive
     // (because objects created in it are still referenced), we don't
@@ -229,16 +235,16 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
     const isolate = env.isolate;
 
     if (comptime IS_DEBUG) {
-        // A page starts off with an opaque origin. After navigation, setOrigin
+        // A frame starts off with an opaque origin. After navigation, setOrigin
         // is called. This is the only time setOrigin should be called for that
-        // page. Therefore, when setOrigin is called, the previous origin should
+        // frame. Therefore, when setOrigin is called, the previous origin should
         // have been opaque and its rc should have been 1.
         lp.assert(self.origin.rc == 1, "Ref opaque origin", .{ .rc = self.origin.rc });
     }
 
-    const origin = try self.session.getOrCreateOrigin(key);
+    const origin = try self.page.getOrCreateOrigin(key);
 
-    self.session.releaseOrigin(self.origin);
+    self.page.releaseOrigin(self.origin);
     self.origin = origin;
 
     {
@@ -254,11 +260,11 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
 }
 
 pub fn trackGlobal(self: *Context, global: v8.Global) !void {
-    return self.session.globals.append(self.session.page_arena, global);
+    return self.page.globals.append(self.page.frame_arena, global);
 }
 
 pub fn trackTemp(self: *Context, global: v8.Global) !void {
-    return self.session.temps.put(self.session.page_arena, global.data_ptr, global);
+    return self.page.temps.put(self.page.frame_arena, global.data_ptr, global);
 }
 
 pub const IdentityResult = struct {
@@ -296,10 +302,10 @@ pub fn toLocal(self: *Context, global: anytype) js.Local.ToLocalReturnType(@Type
     return l.toLocal(global);
 }
 
-pub fn getIncumbent(self: *Context) *Page {
+pub fn getIncumbent(self: *Context) *Frame {
     const ctx = fromC(v8.v8__Isolate__GetIncumbentContext(self.env.isolate.handle).?).?;
     return switch (ctx.global) {
-        .page => |page| page,
+        .frame => |frame| frame,
         .worker => unreachable,
     };
 }
@@ -479,7 +485,7 @@ fn postCompileModule(self: *Context, mod: js.Module, url: [:0]const u8, local: *
     // dependent modules this module has and start downloading them asap.
     const requests = mod.getModuleRequests();
     const request_len = requests.len();
-    const script_manager = self.script_manager.?;
+    const script_manager = self.script_manager;
     for (0..request_len) |i| {
         const specifier = requests.get(i).specifier(local);
         const normalized_specifier = try script_manager.resolveSpecifier(
@@ -585,7 +591,7 @@ pub fn dynamicModuleCallback(
         return @constCast(local.rejectPromise(.{ .generic_error = "Out of memory" }).handle);
     };
 
-    const normalized_specifier = self.script_manager.?.resolveSpecifier(
+    const normalized_specifier = self.script_manager.resolveSpecifier(
         self.arena, // might need to survive until the module is loaded
         resource,
         specifier,
@@ -638,7 +644,7 @@ fn _resolveModuleCallback(self: *Context, referrer: js.Module, specifier: [:0]co
         return error.UnknownModuleReferrer;
     };
 
-    const normalized_specifier = try self.script_manager.?.resolveSpecifier(
+    const normalized_specifier = try self.script_manager.resolveSpecifier(
         self.arena,
         referrer_path,
         specifier,
@@ -649,12 +655,12 @@ fn _resolveModuleCallback(self: *Context, referrer: js.Module, specifier: [:0]co
         return local.toLocal(m).handle;
     }
 
-    var source = self.script_manager.?.waitForImport(normalized_specifier) catch |err| switch (err) {
+    var source = self.script_manager.waitForImport(normalized_specifier) catch |err| switch (err) {
         error.UnknownModule => blk: {
             // Module is in cache but was consumed from imported_modules
             // (e.g., by a previous failed resolution). Re-preload and retry.
-            try self.script_manager.?.preloadImport(normalized_specifier, referrer_path);
-            break :blk try self.script_manager.?.waitForImport(normalized_specifier);
+            try self.script_manager.preloadImport(normalized_specifier, referrer_path);
+            break :blk try self.script_manager.waitForImport(normalized_specifier);
         },
         else => return err,
     };
@@ -723,7 +729,7 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
         };
 
         // Next, we need to actually load it.
-        self.script_manager.?.getAsyncImport(specifier, dynamicModuleSourceCallback, state, referrer) catch |err| {
+        self.script_manager.getAsyncImport(specifier, dynamicModuleSourceCallback, state, referrer) catch |err| {
             const error_msg = local.newString(@errorName(err));
             _ = resolver.reject("dynamic module get async", error_msg);
         };
@@ -792,7 +798,7 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
     return promise;
 }
 
-fn dynamicModuleSourceCallback(ctx: *anyopaque, module_source_: anyerror!ScriptManager.ModuleSource) void {
+fn dynamicModuleSourceCallback(ctx: *anyopaque, module_source_: anyerror!ScriptManagerBase.ModuleSource) void {
     const state: *DynamicModuleResolveState = @ptrCast(@alignCast(ctx));
     var self = state.context;
 
@@ -862,7 +868,7 @@ fn resolveDynamicModule(self: *Context, state: *DynamicModuleResolveState, modul
                 // The microtask is tied to the isolate, not the context
                 // it can be resolved while another context is active
                 // (Which seems crazy to me). If that happens, then
-                // another page was loaded and we MUST ignore this
+                // another frame was loaded and we MUST ignore this
                 // (most of the fields in state are not valid)
                 return;
             }
@@ -905,7 +911,7 @@ fn resolveDynamicModule(self: *Context, state: *DynamicModuleResolveState, modul
 }
 
 // Used to make temporarily enter and exit a context, updating and restoring
-// page.js:
+// frame.js:
 //    var hs: js.HandleScope = undefined;
 //    const entered = ctx.enter(&hs);
 //    defer entered.exit();
@@ -922,7 +928,7 @@ pub fn enter(self: *Context, hs: *js.HandleScope) Entered {
 }
 
 const Entered = struct {
-    // the context we should restore on the page/worker
+    // the context we should restore on the frame/worker
     original: *Context,
 
     // the handle of the entered context
@@ -943,7 +949,7 @@ pub fn queueMutationDelivery(self: *Context) !void {
     self.enqueueMicrotask(struct {
         fn run(ctx: *Context) void {
             switch (ctx.global) {
-                .page => |page| page.deliverMutations(),
+                .frame => |frame| frame.deliverMutations(),
                 .worker => unreachable,
             }
         }
@@ -954,7 +960,7 @@ pub fn queueIntersectionChecks(self: *Context) !void {
     self.enqueueMicrotask(struct {
         fn run(ctx: *Context) void {
             switch (ctx.global) {
-                .page => |page| page.performScheduledIntersectionChecks(),
+                .frame => |frame| frame.performScheduledIntersectionChecks(),
                 .worker => unreachable,
             }
         }
@@ -965,7 +971,7 @@ pub fn queueIntersectionDelivery(self: *Context) !void {
     self.enqueueMicrotask(struct {
         fn run(ctx: *Context) void {
             switch (ctx.global) {
-                .page => |page| page.deliverIntersections(),
+                .frame => |frame| frame.deliverIntersections(),
                 .worker => unreachable,
             }
         }
@@ -976,7 +982,7 @@ pub fn queueSlotchangeDelivery(self: *Context) !void {
     self.enqueueMicrotask(struct {
         fn run(ctx: *Context) void {
             switch (ctx.global) {
-                .page => |page| page.deliverSlotchangeEvents(),
+                .frame => |frame| frame.deliverSlotchangeEvents(),
                 .worker => unreachable,
             }
         }

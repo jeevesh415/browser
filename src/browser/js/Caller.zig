@@ -17,12 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const lp = @import("lightpanda");
 const string = @import("../../string.zig");
 
+const Frame = @import("../Frame.zig");
 const Page = @import("../Page.zig");
 const Session = @import("../Session.zig");
-const WorkerGlobalScope = @import("../webapi/WorkerGlobalScope.zig");
 
 const js = @import("js.zig");
 const Local = @import("Local.zig");
@@ -30,12 +30,13 @@ const Context = @import("Context.zig");
 const TaggedOpaque = @import("TaggedOpaque.zig");
 
 const v8 = js.v8;
+const log = lp.log;
 const ArenaAllocator = std.heap.ArenaAllocator;
-
 const CALL_ARENA_RETAIN = 1024 * 16;
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Caller = @This();
+
 local: Local,
 prev_local: ?*const js.Local,
 prev_context: *Context,
@@ -109,6 +110,10 @@ pub const CallOpts = struct {
     dom_exception: bool = false,
     null_as_undefined: bool = false,
     as_typed_array: bool = false,
+    // Constructor-only. When true, `new.target` is pulled from the
+    // FunctionCallbackInfo and passed as the first argument to the Zig
+    // function (as a js.Function). See bridge.Constructor.Opts.
+    new_target: bool = false,
 };
 
 pub fn constructor(self: *Caller, comptime T: type, func: anytype, handle: *const v8.FunctionCallbackInfo, comptime opts: CallOpts) void {
@@ -125,15 +130,20 @@ pub fn constructor(self: *Caller, comptime T: type, func: anytype, handle: *cons
         return;
     }
 
-    self._constructor(func, info) catch |err| {
+    self._constructor(func, info, opts) catch |err| {
         handleError(T, @TypeOf(func), local, err, info, opts);
     };
 }
 
-fn _constructor(self: *Caller, func: anytype, info: FunctionCallbackInfo) !void {
+fn _constructor(self: *Caller, func: anytype, info: FunctionCallbackInfo, comptime opts: CallOpts) !void {
     const F = @TypeOf(func);
     const local = &self.local;
-    const args = try getArgs(F, 0, local, info);
+    const offset: comptime_int = if (opts.new_target) 1 else 0;
+    var args = try getArgs(F, offset, local, info);
+    if (comptime opts.new_target) {
+        const new_target_handle = v8.v8__FunctionCallbackInfo__NewTarget(info.handle).?;
+        @field(args, "0") = js.Function{ .local = local, .handle = @ptrCast(new_target_handle) };
+    }
     const res = @call(.auto, func, args);
 
     const ReturnType = @typeInfo(F).@"fn".return_type orelse {
@@ -446,6 +456,10 @@ fn tupleFieldName(comptime i: usize) [:0]const u8 {
     };
 }
 
+fn isFrame(comptime T: type) bool {
+    return T == *Frame or T == *const Frame;
+}
+
 fn isPage(comptime T: type) bool {
     return T == *Page or T == *const Page;
 }
@@ -459,19 +473,19 @@ fn isExecution(comptime T: type) bool {
 }
 
 fn getGlobalArg(comptime T: type, ctx: *Context) T {
-    if (comptime isPage(T)) {
+    if (comptime isFrame(T)) {
         return switch (ctx.global) {
-            .page => |page| page,
+            .frame => |frame| frame,
             .worker => unreachable,
         };
     }
 
-    if (comptime isExecution(T)) {
-        return &ctx.execution;
+    if (comptime isPage(T)) {
+        return ctx.page;
     }
 
-    if (comptime isSession(T)) {
-        return ctx.session;
+    if (comptime isExecution(T)) {
+        return &ctx.execution;
     }
 
     @compileError("Unsupported global arg type: " ++ @typeName(T));
@@ -548,6 +562,7 @@ pub const Function = struct {
     pub const Opts = struct {
         noop: bool = false,
         static: bool = false,
+        wpt_only: bool = false,
         deletable: bool = true,
         dom_exception: bool = false,
         as_typed_array: bool = false,
@@ -759,17 +774,17 @@ fn getArgs(comptime F: type, comptime offset: usize, local: *const Local, info: 
             return args;
         }
 
-        // If the last parameter is the Page or Worker, set it, and exclude it
-        // from our params slice, because we don't want to bind it to
-        // a JS argument
+        // If the last parameter is Frame/Page/Session/Execution, set it from
+        // context and exclude it from our params slice, because we don't want
+        // to bind it to a JS argument.
         const LastParamType = params[params.len - 1].type.?;
-        if (comptime isPage(LastParamType) or isExecution(LastParamType) or isSession(LastParamType)) {
+        if (comptime isFrame(LastParamType) or isPage(LastParamType) or isExecution(LastParamType) or isSession(LastParamType)) {
             @field(args, tupleFieldName(params.len - 1 + offset)) = getGlobalArg(LastParamType, local.ctx);
             break :blk params[0 .. params.len - 1];
         }
 
-        // we have neither a Page, Execution, nor a JsObject. All params must be
-        // bound to a JavaScript value.
+        // we have neither a Frame/Page/Session/Execution nor a JsObject.
+        // All params must be bound to a JavaScript value.
         break :blk params;
     };
 
@@ -816,7 +831,9 @@ fn getArgs(comptime F: type, comptime offset: usize, local: *const Local, info: 
             }
         }
 
-        if (comptime isPage(param.type.?)) {
+        if (comptime isFrame(param.type.?)) {
+            @compileError("Frame must be the last parameter: " ++ @typeName(F));
+        } else if (comptime isPage(param.type.?)) {
             @compileError("Page must be the last parameter: " ++ @typeName(F));
         } else if (comptime isExecution(param.type.?)) {
             @compileError("Execution must be the last parameter: " ++ @typeName(F));
@@ -829,7 +846,23 @@ fn getArgs(comptime F: type, comptime offset: usize, local: *const Local, info: 
             @field(args, tupleFieldName(field_index)) = null;
         } else {
             const js_val = info.getArg(@intCast(i), local);
-            @field(args, tupleFieldName(field_index)) = local.jsValueToZig(param.type.?, js_val) catch {
+            // Only fold errors we don't recognize into InvalidArgument; let
+            // domain-meaningful ones (e.g. InvalidCharacterError from a
+            // String.OneByte param) propagate so handleError can map them
+            // to the right DOMException. Compared by name because the per-
+            // type instantiation of jsValueToZig may not include such errors
+            // in its inferred error set.
+            @field(args, tupleFieldName(field_index)) = local.jsValueToZig(param.type.?, js_val) catch |err| {
+                const DOMException = @import("../webapi/DOMException.zig");
+                if (DOMException.fromError(err) != null) {
+                    // I don't love this. But we have [a few] cases when trying to
+                    // map a JS Value that we have a specific DOMException to throw.
+                    // Ideally we should only do this if dom_exception = true in the
+                    // bridge definition. But we don't have access to that here.
+                    // Instead, we just rely on the fact that local.jsValueToZig
+                    // only throws a DOMException-known error when it should.
+                    return err;
+                }
                 return error.InvalidArgument;
             };
         }

@@ -33,10 +33,8 @@ pub fn main() !void {
     }
     lp.log.opts.level = .warn;
     const config = try lp.Config.init(allocator, "legacy-test", .{ .serve = .{
-        .common = .{
-            .tls_verify_host = false,
-            .user_agent_suffix = "internal-tester",
-        },
+        .insecure_disable_tls_host_verification = true,
+        .user_agent_suffix = "internal-tester",
     } });
     defer config.deinit(allocator);
 
@@ -46,10 +44,8 @@ pub fn main() !void {
     var test_arena = std.heap.ArenaAllocator.init(allocator);
     defer test_arena.deinit();
 
-    const http_client = try lp.HttpClient.init(allocator, &app.network);
-    defer http_client.deinit();
-
-    var browser = try lp.Browser.init(app, .{ .http_client = http_client });
+    var browser: lp.Browser = undefined;
+    try browser.init(app, .{}, null);
     defer browser.deinit();
 
     const notification = try lp.Notification.init(allocator);
@@ -94,18 +90,18 @@ pub fn main() !void {
 pub fn run(allocator: Allocator, file: []const u8, session: *lp.Session) !void {
     const url = try std.fmt.allocPrintSentinel(allocator, "http://localhost:9589/{s}", .{file}, 0);
 
-    const page = try session.createPage();
+    const frame = try session.createPage();
     defer session.removePage();
 
     var ls: lp.js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    frame.js.localScope(&ls);
     defer ls.deinit();
 
     var try_catch: lp.js.TryCatch = undefined;
     try_catch.init(&ls.local);
     defer try_catch.deinit();
 
-    try page.navigate(url, .{});
+    try frame.navigate(url, .{});
     var runner = try session.runner(.{});
     try runner.wait(.{ .ms = 2000 });
 

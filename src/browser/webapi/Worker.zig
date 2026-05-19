@@ -17,14 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
-const log = @import("../../log.zig");
-const http = @import("../../network/http.zig");
 
 const URL = @import("../URL.zig");
-const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
+const Frame = @import("../Frame.zig");
 const HttpClient = @import("../HttpClient.zig");
 
 const Blob = @import("Blob.zig");
@@ -33,6 +31,7 @@ const MessageEvent = @import("event/MessageEvent.zig");
 const ErrorEvent = @import("event/ErrorEvent.zig");
 const WorkerGlobalScope = @import("WorkerGlobalScope.zig");
 
+const log = lp.log;
 const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
 const IS_DEBUG = @import("builtin").mode == .Debug;
@@ -41,11 +40,11 @@ const Worker = @This();
 
 // used by HttpClient when generating notification
 // Ultimately used by CDP to generate request/loader ids.
-id: u32,
-_pseudo_frame_id: u32,
+_frame_id: u32,
+_loader_id: u32,
 
 _proto: *EventTarget,
-_page: *Page,
+_frame: *Frame,
 _arena: Allocator,
 _worker_scope: *WorkerGlobalScope,
 
@@ -59,33 +58,40 @@ _on_error: ?js.Function.Global = null,
 _on_message: ?js.Function.Global = null,
 _on_messageerror: ?js.Function.Global = null,
 
-pub fn init(url: []const u8, exec: *Execution) !*Worker {
-    const page = switch (exec.context.global) {
-        .page => |p| p,
-        .worker => return error.WorkerCannotCreateWorker,
-    };
-    const session = page._session;
+pub fn init(url: []const u8, frame: *Frame) !*Worker {
+    const session = frame._session;
 
     const arena = try session.getArena(.large, "Worker");
     errdefer session.releaseArena(arena);
 
-    const resolved_url = try URL.resolve(arena, exec.url.*, url, .{});
-    const self = try session.factory.eventTargetWithAllocator(arena, Worker{
-        .id = session.nextPageId(),
-        ._pseudo_frame_id = session.nextFrameId(),
+    const resolved_url = try URL.resolve(arena, frame.base(), url, .{ .encoding = frame.charset });
+    const self = try frame._page.factory.eventTargetWithAllocator(arena, Worker{
         ._arena = arena,
         ._proto = undefined,
-        ._page = page,
+        ._frame = frame,
         ._url = resolved_url,
         ._worker_scope = undefined,
+        ._frame_id = session.nextFrameId(),
+        ._loader_id = session.nextLoaderId(),
     });
     self._worker_scope = try WorkerGlobalScope.init(self, resolved_url);
     errdefer self._worker_scope.deinit();
-    try page.trackWorker(self);
+    try frame.trackWorker(self);
+
+    // `--disable-workers` (or `LP.configureLoading { worker: false }`):
+    // skip the script fetch and eval. The Worker object is still
+    // constructed so JS `new Worker(url)` does not throw, but the
+    // worker's eval never runs (postMessage from the page is queued
+    // indefinitely with no handler to drain it). Mirrors the
+    // `subframe_loading_enabled` pattern for iframes.
+    if (!session.worker_loading_enabled) {
+        log.debug(.browser, "worker disabled", .{ .url = resolved_url });
+        return self;
+    }
 
     if (std.mem.startsWith(u8, url, "blob:")) {
-        errdefer page.removeWorker(self);
-        const blob: *Blob = page.lookupBlobUrl(url) orelse {
+        errdefer frame.removeWorker(self);
+        const blob: *Blob = frame.lookupBlobUrl(url) orelse {
             log.warn(.js, "invalid blob", .{ .target = "worker" });
             return error.BlobNotFound;
         };
@@ -93,14 +99,14 @@ pub fn init(url: []const u8, exec: *Execution) !*Worker {
         return self;
     }
 
-    const http_client = session.browser.http_client;
-    http_client.request(.{
+    const headers = try session.browser.http_client.newHeaders();
+    frame.makeRequest(.{
         .ctx = self,
-        .url = resolved_url,
         .method = .GET,
-        .headers = try http_client.newHeaders(),
-        .page_id = self.id,
-        .frame_id = self._pseudo_frame_id,
+        .headers = headers,
+        .url = resolved_url,
+        .frame_id = self._frame_id,
+        .loader_id = self._loader_id,
         .resource_type = .script,
         .cookie_jar = &session.cookie_jar,
         .cookie_origin = resolved_url,
@@ -111,21 +117,22 @@ pub fn init(url: []const u8, exec: *Execution) !*Worker {
         .error_callback = httpErrorCallback,
     }) catch |err| {
         log.err(.browser, "Worker request", .{ .url = resolved_url, .err = err });
-        page.removeWorker(self);
+        frame.removeWorker(self);
         return err;
     };
     return self;
 }
 
-// Called from Page.deinit when the page is destroyed, so we don't need to
-// remove from the page's worker list.
+// Called from Frame.deinit when the frame is destroyed, so we don't need to
+// remove from the frame's worker list.
 pub fn deinit(self: *Worker) void {
+    // No pending frame for workers, so we can abort all frames.
     if (self._http_response) |res| {
         res.abort(error.Abort);
         self._http_response = null;
     }
     self._worker_scope.deinit();
-    self._page._session.releaseArena(self._arena);
+    self._frame._session.releaseArena(self._arena);
 }
 
 pub fn asEventTarget(self: *Worker) *EventTarget {
@@ -160,7 +167,6 @@ fn httpDataCallback(response: HttpClient.Response, data: []const u8) !void {
 fn httpDoneCallback(ctx: *anyopaque) !void {
     const self: *Worker = @ptrCast(@alignCast(ctx));
     self._http_response = null;
-    self._script_loaded = true;
 
     const url = self._url;
     const script = self._script_buffer.items;
@@ -176,6 +182,23 @@ fn httpDoneCallback(ctx: *anyopaque) !void {
 }
 
 fn loadInitialScript(self: *Worker, script: []const u8) !void {
+    // Keep buffering throughout the entire outer eval (including any
+    // runMacrotasks pumped by importScripts via the synchronous CDP path,
+    // see WorkerGlobalScope.importScripts). The flip-and-drain happens
+    // via defer so it runs after eval AND after the trailing
+    // runMacrotasks below — by which point the outer script has had its
+    // only chance to register onmessage. drainPendingMessages enqueues
+    // messages in receive order, so pre-eval and during-eval messages
+    // are delivered FIFO on the next runner tick, matching the spec.
+    //
+    // On eval-throw the defer still fires; the messages get scheduled
+    // and then drop at the "no listener" check, mirroring the
+    // httpErrorCallback path.
+    defer {
+        self._script_loaded = true;
+        self._worker_scope.drainPendingMessages();
+    }
+
     var ls: js.Local.Scope = undefined;
     self._worker_scope.js.localScope(&ls);
     defer ls.deinit();
@@ -183,6 +206,21 @@ fn loadInitialScript(self: *Worker, script: []const u8) !void {
     var try_catch: js.TryCatch = undefined;
     try_catch.init(&ls.local);
     defer try_catch.deinit();
+
+    // Mark this worker's ScriptManager as evaluating for the lifetime of
+    // the eval. Worker scripts can call importScripts() which performs a
+    // synchronous HTTP request that pumps the CDP socket while waiting
+    // (HttpClient.syncRequest -> cdp.blocking_read). A CDP message such
+    // as Target.closeTarget arriving on that socket would otherwise tear
+    // down the page (Session.removePage -> Page.deinit -> Frame.deinit ->
+    // Worker.deinit) while this eval is mid-flight, freeing the worker's
+    // arena and identity_map underneath us. Session.removePage walks
+    // every frame's workers and bails out when any is_evaluating, so the
+    // teardown is deferred until the eval unwinds.
+    const sm = &self._worker_scope._script_manager;
+    const was_evaluating = sm.is_evaluating;
+    sm.is_evaluating = true;
+    defer sm.is_evaluating = was_evaluating;
 
     _ = ls.local.eval(script, self._url) catch |err| {
         const caught = try_catch.caughtOrError(self._arena, err);
@@ -203,6 +241,13 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
         .err = err,
     });
 
+    // The worker will never load and onmessage will never be registered.
+    // Drain any buffered messages so they get dispatched (and silently
+    // dropped at the "no listener" check) rather than accumulating until
+    // worker teardown. Future postMessages then schedule normally.
+    self._script_loaded = true;
+    self._worker_scope.drainPendingMessages();
+
     self.fireErrorEvent(@errorName(err), null);
 }
 
@@ -214,13 +259,12 @@ fn fireErrorEvent(self: *Worker, message: []const u8, error_value: ?js.Value.Tem
 }
 
 fn _fireErrorEvent(self: *Worker, message: []const u8, error_value: ?js.Value.Temp) !void {
-    const page = self._page;
-    const session = page._session;
+    const frame = self._frame;
     const target = self.asEventTarget();
     const on_error = self._on_error;
 
     // Check if there are any listeners
-    if (!page._event_manager.hasDirectListeners(target, "error", on_error)) {
+    if (!frame._event_manager.hasDirectListeners(target, "error", on_error)) {
         if (error_value) |ev| ev.release();
         return;
     }
@@ -231,9 +275,9 @@ fn _fireErrorEvent(self: *Worker, message: []const u8, error_value: ?js.Value.Te
         .filename = self._url,
         .bubbles = false,
         .cancelable = true,
-    }, session);
+    }, frame._page);
 
-    try page._event_manager.dispatchDirect(target, error_event.asEvent(), on_error, .{
+    try frame._event_manager.dispatchDirect(target, error_event.asEvent(), on_error, .{
         .context = "Worker.onerror",
     });
 }
@@ -246,17 +290,17 @@ pub fn terminate(self: *Worker) void {
     }
 }
 
-// Posts a message from the page to the worker.
+// Posts a message from the frame to the worker.
 pub fn postMessage(self: *Worker, data: js.Value) !void {
     try self._worker_scope.receiveMessage(data);
 }
 
 // Called internally by WorkerGlobalScope when it wants to post a message to us
 pub fn receiveMessage(self: *Worker, data: js.Value) !void {
-    const page = self._page;
+    const frame = self._frame;
     const cloned_data = blk: {
         var ls: js.Local.Scope = undefined;
-        page.js.localScope(&ls);
+        frame.js.localScope(&ls);
         defer ls.deinit();
 
         // clones from where it currently is (the Worker context) to our Page's context
@@ -264,8 +308,8 @@ pub fn receiveMessage(self: *Worker, data: js.Value) !void {
         break :blk cloned.temp();
     };
 
-    const message_arena = try page.getArena(.tiny, "Worker.receiveMessage");
-    errdefer page.releaseArena(message_arena);
+    const message_arena = try frame.getArena(.tiny, "Worker.receiveMessage");
+    errdefer frame.releaseArena(message_arena);
 
     const callback = try message_arena.create(ReceiveMessageCallback);
     callback.* = .{
@@ -274,7 +318,7 @@ pub fn receiveMessage(self: *Worker, data: js.Value) !void {
         .arena = message_arena,
     };
 
-    try page.js.scheduler.add(callback, ReceiveMessageCallback.run, 0, .{
+    try frame.js.scheduler.add(callback, ReceiveMessageCallback.run, 0, .{
         .name = "Worker.receiveMessage",
         .low_priority = false,
         .finalizer = ReceiveMessageCallback.cancelled,
@@ -332,7 +376,7 @@ const ReceiveMessageCallback = struct {
     }
 
     fn deinit(self: *ReceiveMessageCallback) void {
-        self.worker._page._session.releaseArena(self.arena);
+        self.worker._frame._session.releaseArena(self.arena);
     }
 
     fn run(ctx: *anyopaque) !?u32 {
@@ -340,28 +384,28 @@ const ReceiveMessageCallback = struct {
         defer self.deinit();
 
         const worker = self.worker;
-        const page = worker._page;
+        const frame = worker._frame;
         const target = worker.asEventTarget();
 
         // If data is null, structured clone failed - fire messageerror
         const data = self.data catch |err| {
             const on_messageerror = worker._on_messageerror;
-            if (!page._event_manager.hasDirectListeners(target, "messageerror", on_messageerror)) {
+            if (!frame._event_manager.hasDirectListeners(target, "messageerror", on_messageerror)) {
                 return null;
             }
             const event = (try MessageEvent.initTrusted(comptime .wrap("messageerror"), .{
                 .data = .{ .string = @errorName(err) },
                 .bubbles = false,
                 .cancelable = false,
-            }, page._session)).asEvent();
-            try page._event_manager.dispatchDirect(target, event, on_messageerror, .{ .context = "Worker.messageerror" });
+            }, frame._page)).asEvent();
+            try frame._event_manager.dispatchDirect(target, event, on_messageerror, .{ .context = "Worker.messageerror" });
             return null;
         };
 
         const on_message = worker._on_message;
 
         // Check if there are any listeners before creating the event
-        if (!page._event_manager.hasDirectListeners(target, "message", on_message)) {
+        if (!frame._event_manager.hasDirectListeners(target, "message", on_message)) {
             data.release();
             return null;
         }
@@ -370,9 +414,9 @@ const ReceiveMessageCallback = struct {
             .data = .{ .value = data },
             .bubbles = false,
             .cancelable = false,
-        }, page._session)).asEvent();
+        }, frame._page)).asEvent();
 
-        try page._event_manager.dispatchDirect(target, event, on_message, .{ .context = "Worker.receiveMessage" });
+        try frame._event_manager.dispatchDirect(target, event, on_message, .{ .context = "Worker.receiveMessage" });
 
         return null;
     }
@@ -399,5 +443,8 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: Worker" {
-    try testing.htmlRunner("worker", .{});
+    // Worker tests chain a worker-script fetch with a dynamic-import fetch
+    // and a cross-context postMessage. The default 2 s assertion budget can
+    // blow up on TSAN CI; give it more room.
+    try testing.htmlRunner("worker", .{ .timeout_ms = 8000 });
 }

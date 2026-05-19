@@ -17,9 +17,10 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("js.zig");
-const Page = @import("../Page.zig");
-const Session = @import("../Session.zig");
+const Frame = @import("../Frame.zig");
 
 const v8 = js.v8;
 
@@ -106,27 +107,36 @@ pub fn Builder(comptime T: type) type {
 }
 
 pub const Constructor = struct {
+    arity: c_int,
     func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
 
     const Opts = struct {
         dom_exception: bool = false,
+        // When true, the constructor function receives `new.target` (as a
+        // js.Function) as its first parameter. Used by HTMLElement to support
+        // direct instantiation of custom elements via `new MyElement()`.
+        new_target: bool = false,
     };
 
     fn init(comptime T: type, comptime func: anytype, comptime opts: Opts) Constructor {
-        return .{ .func = struct {
-            fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
-                const v8_isolate = v8.v8__FunctionCallbackInfo__GetIsolate(handle).?;
-                var caller: Caller = undefined;
-                if (!caller.init(v8_isolate)) {
-                    return;
-                }
-                defer caller.deinit();
+        return .{
+            .arity = comptime Function.getArity(@TypeOf(func), if (opts.new_target) 1 else 0),
+            .func = struct {
+                fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+                    const v8_isolate = v8.v8__FunctionCallbackInfo__GetIsolate(handle).?;
+                    var caller: Caller = undefined;
+                    if (!caller.init(v8_isolate)) {
+                        return;
+                    }
+                    defer caller.deinit();
 
-                caller.constructor(T, func, handle.?, .{
-                    .dom_exception = opts.dom_exception,
-                });
-            }
-        }.wrap };
+                    caller.constructor(T, func, handle.?, .{
+                        .dom_exception = opts.dom_exception,
+                        .new_target = opts.new_target,
+                    });
+                }
+            }.wrap,
+        };
     }
 };
 
@@ -134,6 +144,7 @@ pub const Function = struct {
     static: bool,
     arity: usize,
     noop: bool = false,
+    wpt_only: bool = false,
     cache: ?Caller.Function.Opts.Caching = null,
     func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
 
@@ -141,7 +152,10 @@ pub const Function = struct {
         return .{
             .cache = opts.cache,
             .static = opts.static,
-            .arity = getArity(@TypeOf(func)),
+            .wpt_only = opts.wpt_only,
+            // Non-static methods receive `self` as their first param; static
+            // methods don't, so don't skip the first param for them.
+            .arity = getArity(@TypeOf(func), if (opts.static) 0 else 1),
             .func = if (opts.noop) noopFunction else struct {
                 fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
                     Caller.Function.call(T, handle.?, func, opts);
@@ -152,14 +166,32 @@ pub const Function = struct {
 
     pub fn noopFunction(_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {}
 
-    fn getArity(comptime T: type) usize {
+    fn getArity(comptime T: type, comptime start: usize) usize {
+        const Execution = js.Execution;
+
+        const Page = @import("../Page.zig");
+        const Session = @import("../Session.zig");
+
         var count: usize = 0;
         var params = @typeInfo(T).@"fn".params;
-        for (params[1..]) |p| { // start at 1, skip self
+        for (params[start..]) |p| { // start at 1, skip self
             const PT = p.type.?;
+            if (PT == *Frame or PT == *const Frame) {
+                break;
+            }
+
             if (PT == *Page or PT == *const Page) {
                 break;
             }
+
+            if (PT == *Execution or PT == *const Execution) {
+                break;
+            }
+
+            if (PT == *Session or PT == *const Session) {
+                break;
+            }
+
             if (@typeInfo(PT) == .optional) {
                 break;
             }
@@ -172,6 +204,7 @@ pub const Function = struct {
 pub const Accessor = struct {
     static: bool = false,
     deletable: bool = true,
+    wpt_only: bool = false,
     cache: ?Caller.Function.Opts.Caching = null,
     getter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
     setter: ?*const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void = null,
@@ -180,6 +213,7 @@ pub const Accessor = struct {
         var accessor = Accessor{
             .cache = opts.cache,
             .static = opts.static,
+            .wpt_only = opts.wpt_only,
             .deletable = opts.deletable,
         };
 
@@ -422,9 +456,9 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
 
     // Only Page contexts have document.getElementById lookup
     switch (local.ctx.global) {
-        .page => |page| {
-            const document = page.document;
-            if (document.getElementById(property, page)) |el| {
+        .frame => |frame| {
+            const document = frame.document;
+            if (document.getElementById(property, frame)) |el| {
                 const js_val = local.zigValueToJs(el, .{}) catch return 0;
                 var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
                 pc.getReturnValue().set(js_val);
@@ -768,6 +802,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/element/html/Embed.zig"),
     @import("../webapi/element/html/FieldSet.zig"),
     @import("../webapi/element/html/Font.zig"),
+    @import("../webapi/element/html/FrameSet.zig"),
     @import("../webapi/element/html/Form.zig"),
     @import("../webapi/element/html/Generic.zig"),
     @import("../webapi/element/html/Head.zig"),
@@ -816,6 +851,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/element/html/Video.zig"),
     @import("../webapi/element/html/UL.zig"),
     @import("../webapi/element/html/Unknown.zig"),
+    @import("../webapi/element/html/ValidityState.zig"),
     @import("../webapi/element/Svg.zig"),
     @import("../webapi/element/svg/Generic.zig"),
     @import("../webapi/encoding/TextDecoder.zig"),
@@ -851,7 +887,9 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/animation/Animation.zig"),
     @import("../webapi/EventTarget.zig"),
     @import("../webapi/Location.zig"),
+    @import("../webapi/ModelContext.zig"),
     @import("../webapi/Navigator.zig"),
+    @import("../webapi/NavigatorUAData.zig"),
     @import("../webapi/net/FormData.zig"),
     @import("../webapi/net/Headers.zig"),
     @import("../webapi/net/Request.zig"),
@@ -898,6 +936,9 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/CryptoKey.zig"),
     @import("../webapi/Selection.zig"),
     @import("../webapi/ImageData.zig"),
+    @import("../webapi/XPathResult.zig"),
+    @import("../webapi/XPathExpression.zig"),
+    @import("../webapi/XPathEvaluator.zig"),
 });
 
 // APIs available on Worker context globals (constructors like URL, Headers, etc.)
@@ -905,27 +946,58 @@ pub const PageJsApis = flattenTypes(&.{
 // TODO: Expand this list to include all worker-appropriate APIs.
 pub const WorkerJsApis = flattenTypes(&.{
     @import("../webapi/WorkerGlobalScope.zig"),
+    @import("../webapi/WorkerLocation.zig"),
     @import("../webapi/EventTarget.zig"),
+    @import("../webapi/Event.zig"),
+    @import("../webapi/event/MessageEvent.zig"),
+    @import("../webapi/event/ErrorEvent.zig"),
+    @import("../webapi/event/PromiseRejectionEvent.zig"),
+    @import("../webapi/event/CloseEvent.zig"),
     @import("../webapi/DOMException.zig"),
     @import("../webapi/net/URLSearchParams.zig"),
     @import("../webapi/encoding/TextEncoder.zig"),
     @import("../webapi/encoding/TextDecoder.zig"),
+    @import("../webapi/Blob.zig"),
     @import("../webapi/File.zig"),
     @import("../webapi/Console.zig"),
     @import("../webapi/Crypto.zig"),
-    // @import("../webapi/URL.zig"),
-    // @import("../webapi/Blob.zig"),
-    // @import("../webapi/net/FormData.zig"),
+    @import("../webapi/SubtleCrypto.zig"),
+    @import("../webapi/net/FormData.zig"),
+    @import("../webapi/net/Headers.zig"),
+    @import("../webapi/net/Request.zig"),
+    @import("../webapi/net/Response.zig"),
+    @import("../webapi/streams/TransformStream.zig"),
+    @import("../webapi/streams/ReadableStream.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultReader.zig"),
+    @import("../webapi/streams/ReadableStreamDefaultController.zig"),
+    @import("../webapi/streams/WritableStream.zig"),
+    @import("../webapi/streams/WritableStreamDefaultWriter.zig"),
+    @import("../webapi/streams/WritableStreamDefaultController.zig"),
+    @import("../webapi/encoding/TextEncoderStream.zig"),
+    @import("../webapi/encoding/TextDecoderStream.zig"),
+    @import("../webapi/AbortSignal.zig"),
+    @import("../webapi/AbortController.zig"),
+    @import("../webapi/URL.zig"),
+    @import("../webapi/canvas/OffscreenCanvas.zig"),
+    @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
+    @import("../webapi/net/XMLHttpRequest.zig"),
+    @import("../webapi/net/XMLHttpRequestEventTarget.zig"),
+    @import("../webapi/FileReader.zig"),
+    @import("../webapi/ImageData.zig"),
     // @import("../webapi/Performance.zig"),
-    // @import("../webapi/net/Response.zig"),
-    // @import("../webapi/net/Request.zig"),
-    // @import("../webapi/net/Headers.zig"),
-    // @import("../webapi/AbortSignal.zig"),
-    // @import("../webapi/AbortController.zig"),
 });
 
 // Master list of ALL JS APIs across all contexts.
 // Used by Env (class IDs, templates), JsApiLookup, and anywhere that needs
 // to know about all possible types. Individual snapshots use their own
 // subsets (PageJsApis, WorkerSnapshot.JsApis).
-pub const JsApis = PageJsApis ++ [_]type{@import("../webapi/WorkerGlobalScope.zig").JsApi};
+pub const JsApis = blk: {
+    const base = PageJsApis ++ [_]type{
+        @import("../webapi/WorkerGlobalScope.zig").JsApi,
+        @import("../webapi/WorkerLocation.zig").JsApi,
+    };
+    if (lp.build_config.wpt_extensions == false) {
+        break :blk base;
+    }
+    break :blk base ++ [_]type{@import("../webapi/WebDriver.zig").JsApi};
+};

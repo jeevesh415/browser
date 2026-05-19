@@ -54,10 +54,7 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
     defer args.deinit(main_arena);
 
     switch (args.mode) {
-        .help => {
-            args.printUsageAndExit(args.mode.help);
-            return std.process.cleanExit();
-        },
+        .help => |tag| return args.printUsageAndExit(tag, true),
         .version => {
             var stdout = std.fs.File.stdout().writer(&.{});
             try stdout.interface.print("{s}\n", .{lp.build_config.version});
@@ -72,9 +69,9 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
     if (args.logFormat()) |lf| {
         log.opts.format = lf;
     }
-    if (args.logFilterScopes()) |lfs| {
-        log.opts.filter_scopes = lfs;
-    }
+
+    // Set log filter scopes.
+    log.opts.filter_scopes = args.logFilterScopes().items;
 
     // must be installed before any other threads
     const sighandler = try main_arena.create(SigHandler);
@@ -94,7 +91,7 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
             log.debug(.app, "startup", .{ .mode = "serve", .snapshot = app.snapshot.fromEmbedded() });
             const address = std.net.Address.parseIp(opts.host, opts.port) catch |err| {
                 log.fatal(.app, "invalid server address", .{ .err = err, .host = opts.host, .port = opts.port });
-                return args.printUsageAndExit(false);
+                return args.printUsageAndExit(.serve, false);
             };
 
             var server = lp.Server.init(app, address) catch |err| {
@@ -118,16 +115,17 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
         },
         .fetch => |opts| {
             const url = opts.url;
-            log.debug(.app, "startup", .{ .mode = "fetch", .dump_mode = opts.dump_mode, .url = url, .snapshot = app.snapshot.fromEmbedded() });
+            log.debug(.app, "startup", .{ .mode = "fetch", .dump_mode = opts.dump, .url = url, .snapshot = app.snapshot.fromEmbedded() });
 
             var fetch_opts = lp.FetchOpts{
                 .wait_ms = opts.wait_ms,
                 .wait_until = opts.wait_until,
                 .wait_script = opts.wait_script,
+                .inject_script = opts.inject_script,
                 .wait_selector = opts.wait_selector,
-                .dump_mode = opts.dump_mode,
+                .dump_mode = opts.dump,
                 .dump = .{
-                    .strip = opts.strip,
+                    .strip = opts.strip_mode,
                     .with_base = opts.with_base,
                     .with_frames = opts.with_frames,
                 },
@@ -135,11 +133,22 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
 
             var stdout = std.fs.File.stdout();
             var writer = stdout.writer(&.{});
-            if (opts.dump_mode != null) {
+            if (opts.dump != null) {
                 fetch_opts.writer = &writer.interface;
             }
 
-            var worker_thread = try std.Thread.spawn(.{}, fetchThread, .{ app, url, fetch_opts });
+            // Browser owns a V8 isolate, which has thread affinity — it must
+            // be init/used/deinit on the same thread (fetchThread, below). So
+            // we can't treat Browser like the above serve path treats Server.
+            // We need Browser to be createdin fetchThread and to get a reference
+            // to it here.
+            var ft: FetchTerminator = .{};
+            try sighandler.on(FetchTerminator.terminate, .{&ft});
+            if (opts.terminate_ms) |ms| {
+                try sighandler.deadline(ms);
+            }
+
+            var worker_thread = try std.Thread.spawn(.{}, fetchThread, .{ app, &ft, url.?, fetch_opts });
             defer worker_thread.join();
 
             app.network.run();
@@ -169,9 +178,50 @@ fn run(allocator: Allocator, main_arena: Allocator) !void {
     }
 }
 
-fn fetchThread(app: *App, url: [:0]const u8, fetch_opts: lp.FetchOpts) void {
+const FetchTerminator = struct {
+    mutex: std.Thread.Mutex = .{},
+    browser: ?*lp.Browser = null,
+
+    fn storeBrowser(self: *FetchTerminator, browser: *lp.Browser) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.browser = browser;
+    }
+
+    fn releaseBrowser(self: *FetchTerminator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const b = self.browser orelse return;
+        b.env.cancelTerminate();
+        self.browser = null;
+    }
+
+    fn terminate(self: *FetchTerminator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const b = self.browser orelse return;
+        b.env.terminate();
+        self.browser = null;
+    }
+};
+
+fn fetchThread(app: *App, ft: *FetchTerminator, url: [:0]const u8, fetch_opts: lp.FetchOpts) void {
     defer app.network.stop();
-    lp.fetch(app, url, fetch_opts) catch |err| {
+
+    var browser: lp.Browser = undefined;
+    browser.init(app, .{}, null) catch |err| {
+        log.fatal(.app, "browser init error", .{ .err = err });
+        return;
+    };
+    defer browser.deinit();
+
+    ft.storeBrowser(&browser);
+    // if this exits normally, we want to disarm the FetchTerminator so that
+    // any subsequent sighandlers don't try to shutdown an already (or in-the-
+    // process-of) shutting down browser/env
+    defer ft.releaseBrowser();
+
+    lp.fetch(app, &browser, url, fetch_opts) catch |err| {
         log.fatal(.app, "fetch error", .{ .err = err, .url = url });
     };
 }

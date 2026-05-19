@@ -64,9 +64,18 @@ pub const Headers = struct {
         if (header_list == null) {
             return error.OutOfMemory;
         }
+        // libcurl leaves the list intact when curl_slist_append fails, so we own it.
+        errdefer libcurl.curl_slist_free_all(header_list);
 
         // Always add sec-CH-UA header
-        const updated_headers = libcurl.curl_slist_append(header_list, Config.HttpHeaders.sec_ch_ua);
+        const with_sec_ch_ua = libcurl.curl_slist_append(header_list, Config.HttpHeaders.sec_ch_ua);
+        if (with_sec_ch_ua == null) {
+            return error.OutOfMemory;
+        }
+
+        // Always add Accept-Language. Omitting it triggers bot-protection on
+        // some CDNs (Akamai) when Accept-Encoding is present.
+        const updated_headers = libcurl.curl_slist_append(with_sec_ch_ua, Config.HttpHeaders.accept_language);
         if (updated_headers == null) {
             return error.OutOfMemory;
         }
@@ -262,6 +271,7 @@ fn opensocketCallback(
 
 pub const Connection = struct {
     _easy: *libcurl.Curl,
+    in_use: bool,
     transport: Transport,
     node: std.DoublyLinkedList.Node = .{},
 
@@ -278,7 +288,7 @@ pub const Connection = struct {
     ) !Connection {
         const easy = libcurl.curl_easy_init() orelse return error.FailedToInitializeEasy;
 
-        var self = Connection{ ._easy = easy, .transport = .none };
+        var self = Connection{ ._easy = easy, .in_use = false, .transport = .none };
         errdefer self.deinit();
 
         try self.reset(config, ca_blob, ip_filter);

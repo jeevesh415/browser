@@ -18,17 +18,12 @@
 
 const std = @import("std");
 
-pub fn toPageId(comptime id_type: enum { frame_id, loader_id }, input: []const u8) !u32 {
-    const err = switch (comptime id_type) {
-        .frame_id => error.InvalidFrameId,
-        .loader_id => error.InvalidLoaderId,
-    };
-
+pub fn parseFrameId(input: []const u8) !u32 {
     if (input.len < 4) {
-        return err;
+        return error.InvalidFrameId;
     }
 
-    return std.fmt.parseInt(u32, input[4..], 10) catch err;
+    return std.fmt.parseInt(u32, input[4..], 10) catch error.InvalidFrameId;
 }
 
 pub fn toFrameId(id: u32) [14]u8 {
@@ -47,9 +42,8 @@ pub fn toLoaderId(id: u32) [14]u8 {
 // then it should match the loader id.
 const Transfer = @import("../browser/HttpClient.zig").Transfer;
 pub fn toRequestId(transfer: *const Transfer) [14]u8 {
-    const req = transfer.req;
-    if (req.resource_type == .document) {
-        return toLoaderId(req.page_id);
+    if (transfer.req.resource_type == .document) {
+        return toLoaderId(transfer.req.loader_id);
     }
 
     var buf: [14]u8 = undefined;
@@ -60,6 +54,12 @@ pub fn toRequestId(transfer: *const Transfer) [14]u8 {
 pub fn toInterceptId(id: u32) [14]u8 {
     var buf: [14]u8 = undefined;
     _ = std.fmt.bufPrint(&buf, "INT-{d:0>10}", .{id}) catch unreachable;
+    return buf;
+}
+
+pub fn toInvocationId(id: u32) [14]u8 {
+    var buf: [14]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "INV-{d:0>10}", .{id}) catch unreachable;
     return buf;
 }
 
@@ -103,11 +103,16 @@ pub fn Incrementing(comptime T: type, comptime prefix: []const u8) type {
 
         const Self = @This();
 
-        pub fn next(self: *Self) []const u8 {
+        pub fn incr(self: *Self) T {
             const counter = self.counter;
             const n = counter +% 1;
             defer self.counter = n;
 
+            return n;
+        }
+
+        pub fn next(self: *Self) []const u8 {
+            const n = self.incr();
             const size = std.fmt.printInt(self.buffer[NUMERIC_START..], n, 10, .lower, .{});
             return self.buffer[0 .. NUMERIC_START + size];
         }
@@ -160,14 +165,11 @@ test "id: Incrementing.parse" {
     try testing.expectEqual(4294967295, try ReqId.parse("REQ-4294967295"));
 }
 
-test "id: toPageId" {
-    try testing.expectEqual(0, toPageId(.frame_id, "FID-0"));
-    try testing.expectEqual(0, toPageId(.loader_id, "LID-0"));
-
-    try testing.expectEqual(4294967295, toPageId(.frame_id, "FID-4294967295"));
-    try testing.expectEqual(4294967295, toPageId(.loader_id, "LID-4294967295"));
-    try testing.expectError(error.InvalidFrameId, toPageId(.frame_id, ""));
-    try testing.expectError(error.InvalidLoaderId, toPageId(.loader_id, "LID-NOPE"));
+test "id: parseFrameId" {
+    try testing.expectEqual(0, parseFrameId("FID-0"));
+    try testing.expectEqual(4294967295, parseFrameId("FID-4294967295"));
+    try testing.expectError(error.InvalidFrameId, parseFrameId(""));
+    try testing.expectError(error.InvalidFrameId, parseFrameId("FID-"));
 }
 
 test "id: toFrameId" {

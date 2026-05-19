@@ -17,11 +17,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 const builtin = @import("builtin");
-
-const log = @import("../../log.zig");
 const milliTimestamp = @import("../../datetime.zig").milliTimestamp;
 
+const log = lp.log;
 const IS_DEBUG = builtin.mode == .Debug;
 
 const Queue = std.PriorityQueue(Task, void, struct {
@@ -53,6 +53,8 @@ pub fn deinit(self: *Scheduler) void {
 }
 
 pub fn reset(self: *Scheduler) void {
+    finalizeTasks(&self.low_priority);
+    finalizeTasks(&self.high_priority);
     self.low_priority.clearRetainingCapacity();
     self.high_priority.clearRetainingCapacity();
 }
@@ -80,9 +82,8 @@ pub fn add(self: *Scheduler, ctx: *anyopaque, cb: Callback, run_in_ms: u32, opts
 }
 
 pub fn run(self: *Scheduler) !void {
-    const now = milliTimestamp(.monotonic);
-    try self.runQueue(&self.low_priority, now);
-    try self.runQueue(&self.high_priority, now);
+    try self.runQueue(&self.low_priority);
+    try self.runQueue(&self.high_priority);
 }
 
 pub fn hasReadyTasks(self: *Scheduler) bool {
@@ -99,10 +100,12 @@ pub fn msToNextHigh(self: *Scheduler) ?u64 {
     return @intCast(task.run_at - now);
 }
 
-fn runQueue(self: *Scheduler, queue: *Queue, now: u64) !void {
+fn runQueue(self: *Scheduler, queue: *Queue) !void {
     if (queue.count() == 0) {
         return;
     }
+    const start = milliTimestamp(.monotonic);
+    var now = start;
 
     while (queue.peek()) |*task_| {
         if (task_.run_at > now) {
@@ -125,6 +128,11 @@ fn runQueue(self: *Scheduler, queue: *Queue, now: u64) !void {
             }
             task.run_at = now + ms;
             try self.low_priority.add(task);
+        }
+
+        now = milliTimestamp(.monotonic);
+        if (now - start > 500) {
+            return;
         }
     }
     return;

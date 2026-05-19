@@ -17,6 +17,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const idna = @import("../sys/idna.zig");
+
 const Allocator = std.mem.Allocator;
 
 pub const ResolveOpts = struct {
@@ -190,11 +192,35 @@ pub fn resolve(allocator: Allocator, base: [:0]const u8, source_path: anytype, o
 }
 
 fn processResolved(allocator: Allocator, url: [:0]const u8, opts: ResolveOpts) ![:0]const u8 {
-    const encoding = opts.encoding orelse return url;
+    const encoding = opts.encoding orelse return ensureHostAscii(allocator, url);
     return ensureEncoded(allocator, url, encoding);
 }
 
-pub fn ensureEncoded(allocator: Allocator, url: [:0]const u8, encoding: []const u8) ![:0]const u8 {
+/// IDNA-only pass: converts a non-ASCII host (`räksmörgås.se`) to its
+/// punycode form (`xn--rksmrgs-5wao1o.se`) and leaves everything else alone.
+fn ensureHostAscii(allocator: Allocator, url: [:0]const u8) ![:0]const u8 {
+    const hostname = getHostname(url);
+    if (hostname.len == 0 or !idna.needsAscii(hostname)) {
+        return url;
+    }
+
+    const ascii = try idna.toAscii(allocator, hostname);
+
+    // hostname is a slice of url, so its start offset is just pointer arithmetic.
+    const start = @intFromPtr(hostname.ptr) - @intFromPtr(url.ptr);
+    const end = start + hostname.len;
+    var buf = try std.ArrayList(u8).initCapacity(allocator, url.len - hostname.len + ascii.len + 1);
+    buf.appendSliceAssumeCapacity(url[0..start]);
+    buf.appendSliceAssumeCapacity(ascii);
+    buf.appendSliceAssumeCapacity(url[end..]);
+    buf.appendAssumeCapacity(0);
+    return buf.items[0 .. buf.items.len - 1 :0];
+}
+
+pub fn ensureEncoded(allocator: Allocator, url_in: [:0]const u8, encoding: []const u8) ![:0]const u8 {
+    // Resolve any IDN host first; everything below operates on the ASCII form.
+    const url = try ensureHostAscii(allocator, url_in);
+
     const scheme_end = std.mem.indexOf(u8, url, "://");
     const authority_start = if (scheme_end) |end| end + 3 else 0;
     const path_start = std.mem.indexOfScalarPos(u8, url, authority_start, '/') orelse return url;
@@ -857,8 +883,9 @@ fn parseAuthority(raw: []const u8) ?AuthorityInfo {
     const scheme_end = std.mem.indexOf(u8, raw, "://") orelse return null;
     const authority_start = scheme_end + 3;
 
-    // Find end of authority FIRST (start of path/query/fragment or end of string)
-    const authority_end = if (std.mem.indexOfAny(u8, raw[authority_start..], "/?#")) |end|
+    // Find end of authority FIRST (start of path/query/fragment,
+    // a NUL/CR/LF/TAB, or end of string).
+    const authority_end = if (std.mem.indexOfAny(u8, raw[authority_start..], "/?#\x00\r\n\t")) |end|
         authority_start + end
     else
         raw.len;
@@ -1309,7 +1336,7 @@ test "URL: resolve with encoding" {
         },
         // Relative paths with encoding
         .{
-            .base = "https://example.com/dir/page.html",
+            .base = "https://example.com/dir/frame.html",
             .path = "../other dir/file.html",
             .expected = "https://example.com/other%20dir/file.html",
         },
@@ -1553,6 +1580,12 @@ test "URL: getHost" {
     try testing.expectEqualSlices(u8, "evil.example.com", getHost("http://evil.example.com/@victim.example.com/"));
     try testing.expectEqualSlices(u8, "evil.example.com", getHost("https://evil.example.com/path/@victim.example.com"));
 
+    try testing.expectEqual("evil.example.com:8521", getHost("http://evil.example.com:8521\x00@victim.example.com:8520/"));
+    try testing.expectEqual("evil.example.com", getHost("http://evil.example.com\x00@victim.example.com/"));
+    try testing.expectEqual("evil.example.com", getHost("http://evil.example.com\r@victim.example.com/"));
+    try testing.expectEqual("evil.example.com", getHost("http://evil.example.com\n@victim.example.com/"));
+    try testing.expectEqual("evil.example.com", getHost("http://evil.example.com\t@victim.example.com/"));
+
     // IPv6 addresses
     try testing.expectEqualSlices(u8, "[::1]:8080", getHost("http://[::1]:8080/path"));
     try testing.expectEqualSlices(u8, "[::1]", getHost("http://[::1]/path"));
@@ -1642,6 +1675,17 @@ test "URL: getOrigin" {
         .{ .url = "http://evil.example.com/@victim.example.com/", .expected = "http://evil.example.com" },
         .{ .url = "https://evil.example.com/path/@victim.example.com/steal", .expected = "https://evil.example.com" },
         .{ .url = "http://evil.example.com/@victim.example.com:443/", .expected = "http://evil.example.com" },
+
+        // SECURITY: Null byte injection.
+        .{ .url = "http://attacker:8521\x00@victim:8520/", .expected = "http://attacker:8521" },
+        .{ .url = "http://attacker.com\x00@victim.com/", .expected = "http://attacker.com" },
+        .{ .url = "http://attacker.com/\x00@victim.com/", .expected = "http://attacker.com" },
+
+        // SECURITY: CR / LF / TAB are stripped by the WHATWG URL parser, so a
+        // userinfo "@" hidden behind one must not change the origin here either.
+        .{ .url = "http://attacker.com\r@victim.com/", .expected = "http://attacker.com" },
+        .{ .url = "http://attacker.com\n@victim.com/", .expected = "http://attacker.com" },
+        .{ .url = "http://attacker.com\t@victim.com/", .expected = "http://attacker.com" },
 
         // @ in query/fragment must also not affect origin
         .{ .url = "https://example.com/path?user=foo@bar.com", .expected = "https://example.com" },

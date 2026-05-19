@@ -17,9 +17,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const lp = @import("lightpanda");
 const Http = @import("../http.zig");
 const FsCache = @import("FsCache.zig");
+
+const log = lp.log;
 
 /// A browser-wide cache for resources across the network.
 /// This mostly conforms to RFC9111 with regards to caching behavior.
@@ -44,6 +46,12 @@ pub fn get(self: *Cache, arena: std.mem.Allocator, req: CacheRequest) ?CachedRes
 pub fn put(self: *Cache, metadata: CachedMetadata, body: []const u8) !void {
     return switch (self.kind) {
         inline else => |*c| c.put(metadata, body),
+    };
+}
+
+pub fn clear(self: *Cache) !void {
+    return switch (self.kind) {
+        inline else => |*c| c.clear(),
     };
 }
 

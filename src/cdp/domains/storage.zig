@@ -17,13 +17,13 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
 
 const CDP = @import("../CDP.zig");
-
-const log = @import("../../log.zig");
 const URL = @import("../../browser/URL.zig");
 const Cookie = @import("../../browser/webapi/storage/storage.zig").Cookie;
 
+const log = lp.log;
 const CookieJar = Cookie.Jar;
 pub const PreparedUri = Cookie.PreparedUri;
 
@@ -132,7 +132,7 @@ pub const CdpCookie = struct {
 
 pub fn setCdpCookie(cookie_jar: *CookieJar, param: CdpCookie) !void {
     // Silently ignore partitionKey since we don't support partitioned cookies (CHIPS).
-    // This allows Puppeteer's page.setCookie() to work, which may send cookies with
+    // This allows Puppeteer's frame.setCookie() to work, which may send cookies with
     // partitionKey as part of its cookie-setting workflow.
     if (param.partitionKey != null) {
         log.warn(.not_implemented, "partition key", .{ .src = "setCdpCookie" });
@@ -167,7 +167,7 @@ pub fn setCdpCookie(cookie_jar: *CookieJar, param: CdpCookie) !void {
             .None => .none,
         },
     };
-    try cookie_jar.add(cookie, std.time.timestamp());
+    try cookie_jar.add(cookie, std.time.timestamp(), true);
 }
 
 pub const CookieWriter = struct {

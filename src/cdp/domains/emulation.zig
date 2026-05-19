@@ -17,9 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const CDP = @import("../CDP.zig");
-const log = @import("../../log.zig");
 const Config = @import("../../Config.zig");
+
+const log = lp.log;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
@@ -95,7 +98,7 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
     };
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const http_client = cmd.cdp.browser.http_client;
+    const http_client = &cmd.cdp.browser.http_client;
     try http_client.setUserAgentOverride(ua);
     bc.user_agent_changed = true;
 

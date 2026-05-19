@@ -17,11 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
 const Event = @import("../Event.zig");
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 const CloseEvent = @This();
@@ -38,23 +39,23 @@ const CloseEventOptions = struct {
 
 const Options = Event.inheritOptions(CloseEvent, CloseEventOptions);
 
-pub fn init(typ: []const u8, _opts: ?Options, page: *Page) !*CloseEvent {
-    const arena = try page.getArena(.tiny, "CloseEvent");
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*CloseEvent {
+    const arena = try frame.getArena(.tiny, "CloseEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, _opts, false, page);
+    return initWithTrusted(arena, type_string, _opts, false, frame);
 }
 
-pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*CloseEvent {
-    const arena = try page.getArena(.tiny, "CloseEvent.trusted");
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, _opts, true, page);
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*CloseEvent {
+    const arena = try frame.getArena(.tiny, "CloseEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
 }
 
-fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, page: *Page) !*CloseEvent {
+fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, frame: *Frame) !*CloseEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         typ,
         CloseEvent{

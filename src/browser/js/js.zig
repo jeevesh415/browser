@@ -42,6 +42,7 @@ pub const Object = @import("Object.zig");
 pub const TryCatch = @import("TryCatch.zig");
 pub const Function = @import("Function.zig");
 pub const Promise = @import("Promise.zig");
+pub const RegExp = @import("RegExp.zig");
 pub const Module = @import("Module.zig");
 pub const BigInt = @import("BigInt.zig");
 pub const Number = @import("Number.zig");
@@ -234,6 +235,7 @@ pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool,
         .@"struct" => {
             switch (@TypeOf(value)) {
                 string.String => return isolate.initStringHandle(value.str()),
+                String.OneByte => return @ptrCast(isolate.initOneByteStringHandle(value.bytes)),
                 ArrayBuffer => {
                     const values = value.values;
                     const len = values.len;
@@ -318,6 +320,9 @@ pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool,
     }
     return null;
 }
+
+// marker interface
+pub const Undefined = struct {};
 
 // These are here, and not in Inspector.zig, because Inspector.zig isn't always
 // included (e.g. in the wpt build).

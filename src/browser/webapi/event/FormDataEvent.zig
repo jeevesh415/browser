@@ -17,15 +17,17 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-const String = @import("../../../string.zig").String;
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
+const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
 
 const FormData = @import("../net/FormData.zig");
+
+const String = lp.String;
+const Allocator = std.mem.Allocator;
 
 /// https://developer.mozilla.org/en-US/docs/Web/API/FormDataEvent
 const FormDataEvent = @This();
@@ -37,23 +39,23 @@ const Options = Event.inheritOptions(FormDataEvent, struct {
     formData: ?*FormData = null,
 });
 
-pub fn init(typ: []const u8, maybe_options: Options, page: *Page) !*FormDataEvent {
-    const arena = try page.getArena(.tiny, "FormDataEvent");
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, maybe_options: Options, frame: *Frame) !*FormDataEvent {
+    const arena = try frame.getArena(.tiny, "FormDataEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, maybe_options, false, page);
+    return initWithTrusted(arena, type_string, maybe_options, false, frame);
 }
 
-pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*FormDataEvent {
-    const arena = try page.getArena(.tiny, "FormDataEvent.trusted");
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, _opts, true, page);
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*FormDataEvent {
+    const arena = try frame.getArena(.tiny, "FormDataEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
 }
 
-fn initWithTrusted(arena: Allocator, typ: String, maybe_options: ?Options, trusted: bool, page: *Page) !*FormDataEvent {
+fn initWithTrusted(arena: Allocator, typ: String, maybe_options: ?Options, trusted: bool, frame: *Frame) !*FormDataEvent {
     const options = maybe_options orelse Options{};
 
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         typ,
         FormDataEvent{

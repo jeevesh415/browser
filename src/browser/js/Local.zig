@@ -17,10 +17,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const lp = @import("lightpanda");
 const string = @import("../../string.zig");
 
-const Session = @import("../Session.zig");
+const Page = @import("../Page.zig");
+const FinalizerCallback = @import("../Session.zig").FinalizerCallback;
 
 const js = @import("js.zig");
 const bridge = @import("bridge.zig");
@@ -29,12 +30,11 @@ const Context = @import("Context.zig");
 const Isolate = @import("Isolate.zig");
 const TaggedOpaque = @import("TaggedOpaque.zig");
 
-const IS_DEBUG = @import("builtin").mode == .Debug;
-
 const v8 = js.v8;
+const log = lp.log;
 const CallOpts = Caller.CallOpts;
 
-// Where js.Context has a lifetime tied to the page, and holds the
+// Where js.Context has a lifetime tied to the frame, and holds the
 // v8::Global<v8::Context>, this has a much shorter lifetime and holds a
 // v8::Local<v8::Context>. In V8, you need a Local<v8::Context> or get anything
 // done, but the local only exists for the lifetime of the HandleScope it was
@@ -59,6 +59,17 @@ pub fn newString(self: *const Local, str: []const u8) js.String {
     return .{
         .local = self,
         .handle = self.isolate.initStringHandle(str),
+    };
+}
+
+// Creates a JS string by mapping each input byte 0..255 directly to a JS
+// code unit, with no UTF-8 decoding. Use this when handing back binary data
+// (e.g. atob output) — passing those bytes through `newString` would treat
+// any byte 0x80..0xFF as malformed UTF-8 and replace it with U+FFFD.
+pub fn newOneByteString(self: *const Local, bytes: []const u8) js.String {
+    return .{
+        .local = self,
+        .handle = self.isolate.initOneByteStringHandle(bytes),
     };
 }
 
@@ -120,14 +131,14 @@ pub fn exec(self: *const Local, src: []const u8, name: ?[]const u8) !js.Value {
 /// https://v8.github.io/api/head/classv8_1_1ScriptCompiler.html#a3a15bb5a7dfc3f998e6ac789e6b4646a
 pub fn compileFunction(
     self: *const Local,
-    function_body: []const u8,
+    src: anytype,
     /// We tend to know how many params we'll pass; can remove the comptime if necessary.
     comptime parameter_names: []const []const u8,
     extensions: []const v8.Object,
 ) !js.Function {
     // TODO: Make configurable.
     const script_name = self.isolate.initStringHandle("anonymous");
-    const script_source = self.isolate.initStringHandle(function_body);
+    const script_source = if (@TypeOf(src) == js.String) src.handle else self.isolate.initStringHandle(src);
 
     var parameter_list: [parameter_names.len]*const v8.String = undefined;
     inline for (0..parameter_names.len) |i| {
@@ -270,22 +281,28 @@ pub fn mapZigInstanceToJs(self: *const Local, js_obj_handle: ?*const v8.Object, 
             if (resolved.finalizer) |finalizer| {
                 const finalizer_ptr_id = finalizer.ptr_id;
 
-                const session = ctx.session;
-                const finalizer_gop = try session.finalizer_callbacks.getOrPut(session.page_arena, finalizer_ptr_id);
+                const page = ctx.page;
+                const session = page.session;
+                const finalizer_gop = try page.finalizer_callbacks.getOrPut(page.frame_arena, finalizer_ptr_id);
                 if (finalizer_gop.found_existing == false) {
                     // This is the first context (and very likely only one) to
                     // see this Zig instance. We need to create the FinalizerCallback
-                    // so that we can cleanup on page reset if v8 doesn't finalize.
-                    errdefer _ = session.finalizer_callbacks.remove(finalizer_ptr_id);
+                    // so that we can cleanup on Page teardown if v8 doesn't finalize.
+                    errdefer _ = page.finalizer_callbacks.remove(finalizer_ptr_id);
                     finalizer.acquire_ref(finalizer_ptr_id);
                     finalizer_gop.value_ptr.* = try self.createFinalizerCallback(resolved_ptr_id, finalizer_ptr_id, finalizer.release_ref_from_zig);
                 }
                 const fc = finalizer_gop.value_ptr.*;
-                const identity_finalizer = try fc.arena.create(Session.FinalizerCallback.Identity);
+                const identity_finalizer = try session.fc_identity_pool.create();
                 identity_finalizer.* = .{
-                    .fc = fc,
+                    .page = page,
+                    .session = session,
                     .identity = ctx.identity,
+                    .finalizer_ptr_id = finalizer_ptr_id,
+                    .resolved_ptr_id = resolved_ptr_id,
+                    .next = fc.identities,
                 };
+                fc.identities = identity_finalizer;
                 fc.identity_count += 1;
 
                 v8.v8__Global__SetWeakFinalizer(gop.value_ptr, identity_finalizer, finalizer.release_ref, v8.kParameter);
@@ -332,15 +349,15 @@ pub fn zigValueToJs(self: *const Local, value: anytype, comptime opts: CallOpts)
                 }
 
                 if (@typeInfo(ptr.child) == .@"struct" and @hasDecl(ptr.child, "runtimeGenericWrap")) {
-                    const page = switch (self.ctx.global) {
-                        .page => |p| p,
+                    const frame = switch (self.ctx.global) {
+                        .frame => |f| f,
                         .worker => {
                             // No Worker-related API currently uses this, so haven't
                             // added support for it
                             unreachable;
                         },
                     };
-                    const wrap = try value.runtimeGenericWrap(page);
+                    const wrap = try value.runtimeGenericWrap(frame);
                     return self.zigValueToJs(wrap, opts);
                 }
 
@@ -412,20 +429,23 @@ pub fn zigValueToJs(self: *const Local, value: anytype, comptime opts: CallOpts)
                 js.Promise.Temp,
                 js.PromiseResolver.Global,
                 js.Module.Global => return .{ .local = self, .handle = @ptrCast(value.local(self).handle) },
+
+                js.Undefined => return .{.local = self, .handle = isolate.initUndefined() },
+
                 else => {}
             }
             // zig fmt: on
 
             if (@hasDecl(T, "runtimeGenericWrap")) {
-                const page = switch (self.ctx.global) {
-                    .page => |p| p,
+                const frame = switch (self.ctx.global) {
+                    .frame => |f| f,
                     .worker => {
                         // No Worker-related API currently uses this, so haven't
                         // added support for it
                         unreachable;
                     },
                 };
-                const wrap = try value.runtimeGenericWrap(page);
+                const wrap = try value.runtimeGenericWrap(frame);
                 return self.zigValueToJs(wrap, opts);
             }
 
@@ -734,6 +754,16 @@ fn jsValueToStruct(self: *const Local, comptime T: type, js_val: js.Value) !?T {
                 js.Promise.Global => try js_promise.persist(),
                 else => unreachable,
             };
+        },
+        js.String => return js_val.isString(),
+        js.String.OneByte => {
+            // Receives a "binary string": each JS code unit must fit in a byte
+            // (0..255). Throws InvalidCharacterError if any code unit is out
+            // of range, matching the WHATWG btoa spec — which is the main
+            // intended caller, but applicable to any binary-string input.
+            const js_str = js_val.isString() orelse return null;
+            if (!js_str.containsOnlyOneByte()) return error.InvalidCharacterError;
+            return .{ .bytes = try js_str.toOneByteSlice(self.call_arena) };
         },
         string.String => {
             const js_str = js_val.isString() orelse return null;
@@ -1170,7 +1200,7 @@ const Resolved = struct {
         ptr_id: usize,
         acquire_ref: *const fn (ptr_id: usize) void,
         release_ref: *const fn (handle: ?*const v8.WeakCallbackInfo) callconv(.c) void,
-        release_ref_from_zig: *const fn (ptr_id: usize, session: *Session) void,
+        release_ref_from_zig: *const fn (ptr_id: usize, page: *Page) void,
     };
 };
 pub fn resolveValue(value: anytype) Resolved {
@@ -1216,36 +1246,42 @@ fn resolveT(comptime T: type, value: *T) Resolved {
 
                 fn releaseRef(handle: ?*const v8.WeakCallbackInfo) callconv(.c) void {
                     const ptr = v8.v8__WeakCallbackInfo__GetParameter(handle.?).?;
-                    const identity_finalizer: *Session.FinalizerCallback.Identity = @ptrCast(@alignCast(ptr));
+                    const identity_finalizer: *FinalizerCallback.Identity = @ptrCast(@alignCast(ptr));
 
-                    const fc = identity_finalizer.fc;
-                    const session = fc.session;
-                    const finalizer_ptr_id = fc.finalizer_ptr_id;
+                    // Identity is allocated from pool, so it's valid even after frame reset.
+                    const page = identity_finalizer.page;
+                    const resolved_ptr_id = identity_finalizer.resolved_ptr_id;
+                    defer page.session.fc_identity_pool.destroy(identity_finalizer);
 
-                    // Remove from this identity's map
-                    if (identity_finalizer.identity.identity_map.fetchRemove(fc.resolved_ptr_id)) |kv| {
+                    // Always clean up the identity map entry
+                    if (identity_finalizer.identity.identity_map.fetchRemove(resolved_ptr_id)) |kv| {
                         var global = kv.value;
                         v8.v8__Global__Reset(&global);
                     }
 
+                    // If done, FC was already cleaned up during Page teardown.
+                    // The finalizer_ptr_id may have been reused for a new object,
+                    // so we must not look it up in the map. It's also unsafe to
+                    // dereference identity_finalizer.page after done is true.
+                    if (identity_finalizer.done) return;
+
+                    const finalizer_ptr_id = identity_finalizer.finalizer_ptr_id;
+                    const fc = page.finalizer_callbacks.get(finalizer_ptr_id) orelse return;
+
                     const identity_count = fc.identity_count;
                     if (identity_count == 1) {
-                        // All IsolatedWorlds that reference this object have
-                        // released it. Release the instance ref, remove the
-                        // FinalizerCallback and free it.
-                        FT.releaseRef(@ptrFromInt(finalizer_ptr_id), session);
-                        const removed = session.finalizer_callbacks.remove(finalizer_ptr_id);
-                        if (comptime IS_DEBUG) {
-                            std.debug.assert(removed);
-                        }
-                        session.releaseArena(fc.arena);
+                        // Last identity - clean up the FC.
+                        // Remove from map before releaseRef to prevent address reuse issues.
+                        _ = page.finalizer_callbacks.remove(finalizer_ptr_id);
+                        FT.releaseRef(@ptrFromInt(finalizer_ptr_id), page);
+                        page.releaseArena(fc.arena);
                     } else {
                         fc.identity_count = identity_count - 1;
                     }
                 }
 
-                fn releaseRefFromZig(ptr_id: usize, session: *Session) void {
-                    FT.releaseRef(@ptrFromInt(ptr_id), session);
+                fn releaseRefFromZig(ptr_id: usize, page: *Page) void {
+                    FT.releaseRef(@ptrFromInt(ptr_id), page);
                 }
             };
             break :blk .{
@@ -1452,16 +1488,19 @@ pub fn parseJSON(self: *const Local, json: []const u8) !js.Value {
     };
 }
 
-pub fn throw(self: *const Local, err: []const u8) js.Exception {
-    const handle = self.isolate.createError(err);
+pub fn newException(self: *const Local, ex: anytype) js.Exception {
+    const js_val = self.zigValueToJs(ex, .{}) catch {
+        return .{ .local = self, .handle = self.isolate.createError("internal error") };
+    };
+
     return .{
         .local = self,
-        .handle = handle,
+        .handle = js_val.handle,
     };
 }
 
 // Convert a Global (or optional Global) to a Local (or optional Local).
-// Meant to be used from either page.js.toLocal, where the context must have an
+// Meant to be used from either frame.js.toLocal, where the context must have an
 // non-null local (orelse panic), or from a LocalScope
 pub fn toLocal(self: *const Local, global: anytype) ToLocalReturnType(@TypeOf(global)) {
     const T = @TypeOf(global);
@@ -1511,17 +1550,17 @@ fn createFinalizerCallback(
     // The most specific value where finalizers are defined
     // What actually gets acquired / released / deinit
     finalizer_ptr_id: usize,
-    release_ref: *const fn (ptr_id: usize, session: *Session) void,
-) !*Session.FinalizerCallback {
-    const session = self.ctx.session;
+    release_ref: *const fn (ptr_id: usize, page: *Page) void,
+) !*FinalizerCallback {
+    const page = self.ctx.page;
 
-    const arena = try session.getArena(.tiny, "FinalizerCallback");
-    errdefer session.releaseArena(arena);
+    const arena = try page.getArena(.tiny, "FinalizerCallback");
+    errdefer page.releaseArena(arena);
 
-    const fc = try arena.create(Session.FinalizerCallback);
+    const fc = try arena.create(FinalizerCallback);
     fc.* = .{
+        .page = page,
         .arena = arena,
-        .session = session,
         .release_ref = release_ref,
         .resolved_ptr_id = resolved_ptr_id,
         .finalizer_ptr_id = finalizer_ptr_id,
@@ -1548,12 +1587,12 @@ fn createFinalizerCallback(
 // initiated or not), we need to create a Local.Scope:
 //
 //   var ls: js.Local.Scope = udnefined;
-//   page.js.localScope(&ls);
+//   frame.js.localScope(&ls);
 //   defer ls.deinit();
 //   // can use ls.local as needed.
 //
 // Note: Zig code that is 100% guaranteed to be v8-initiated can get a local via:
-//   page.js.local.?
+//   frame.js.local.?
 pub const Scope = struct {
     local: Local,
     handle_scope: js.HandleScope,

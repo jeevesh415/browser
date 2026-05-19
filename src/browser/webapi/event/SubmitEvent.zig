@@ -17,13 +17,15 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
-const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
+const Frame = @import("../../Frame.zig");
+
 const Event = @import("../Event.zig");
 const HtmlElement = @import("../element/Html.zig");
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 /// https://developer.mozilla.org/en-US/docs/Web/API/SubmitEvent
@@ -38,23 +40,23 @@ const SubmitEventOptions = struct {
 
 const Options = Event.inheritOptions(SubmitEvent, SubmitEventOptions);
 
-pub fn init(typ: []const u8, opts_: ?Options, page: *Page) !*SubmitEvent {
-    const arena = try page.getArena(.tiny, "SubmitEvent");
-    errdefer page.releaseArena(arena);
+pub fn init(typ: []const u8, opts_: ?Options, frame: *Frame) !*SubmitEvent {
+    const arena = try frame.getArena(.tiny, "SubmitEvent");
+    errdefer frame.releaseArena(arena);
     const type_string = try String.init(arena, typ, .{});
-    return initWithTrusted(arena, type_string, opts_, false, page);
+    return initWithTrusted(arena, type_string, opts_, false, frame);
 }
 
-pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*SubmitEvent {
-    const arena = try page.getArena(.tiny, "SubmitEvent.trusted");
-    errdefer page.releaseArena(arena);
-    return initWithTrusted(arena, typ, _opts, true, page);
+pub fn initTrusted(typ: String, _opts: ?Options, frame: *Frame) !*SubmitEvent {
+    const arena = try frame.getArena(.tiny, "SubmitEvent.trusted");
+    errdefer frame.releaseArena(arena);
+    return initWithTrusted(arena, typ, _opts, true, frame);
 }
 
-fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, page: *Page) !*SubmitEvent {
+fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, frame: *Frame) !*SubmitEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.event(
+    const event = try frame._factory.event(
         arena,
         typ,
         SubmitEvent{

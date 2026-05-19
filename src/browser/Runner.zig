@@ -20,33 +20,32 @@ const std = @import("std");
 const lp = @import("lightpanda");
 const builtin = @import("builtin");
 
-const log = @import("../log.zig");
-
 const js = @import("js/js.zig");
-const Page = @import("Page.zig");
+const Frame = @import("Frame.zig");
 const Session = @import("Session.zig");
 const HttpClient = @import("HttpClient.zig");
 
 const Node = @import("webapi/Node.zig");
 const Selector = @import("webapi/selector/Selector.zig");
 
+const log = lp.log;
 const IS_DEBUG = builtin.mode == .Debug;
 
 const Runner = @This();
 
-page: *Page,
+frame: *Frame,
 session: *Session,
 http_client: *HttpClient,
 
 pub const Opts = struct {};
 
 pub fn init(session: *Session, _: Opts) !Runner {
-    const page = &(session.page orelse return error.NoPage);
+    const frame = session.currentFrame() orelse return error.NoPage;
 
     return .{
-        .page = page,
+        .frame = frame,
         .session = session,
-        .http_client = session.browser.http_client,
+        .http_client = &session.browser.http_client,
     };
 }
 
@@ -67,19 +66,38 @@ pub fn waitCDP(self: *Runner, opts: WaitOpts) !CDPWaitResult {
 }
 
 fn _wait(self: *Runner, comptime is_cdp: bool, opts: WaitOpts) !CDPWaitResult {
+    const session = self.session;
+    const browser = session.browser;
+
     var timer = try std.time.Timer.start();
 
     const tick_opts = TickOpts{
         .ms = 200,
         .until = opts.until,
     };
+
+    // Periodic V8 GC hint during long waits. V8 is otherwise only nudged on
+    // session/page teardown (Browser.zig, Page.zig), so a page that stays
+    // alive for seconds while running heavy JS accumulates wrappers and
+    // external-ref'd Zig allocations V8 has no reason to drop. `.moderate`
+    // speeds up incremental GC without stalling the tick.
+    const gc_hint_period_ns: u64 = std.time.ns_per_s;
+    var gc_hint_timer = std.time.Timer.start() catch unreachable;
+
     while (true) {
+        if (gc_hint_timer.read() >= gc_hint_period_ns) {
+            gc_hint_timer.reset();
+            self.frame._page.cleanupClosedPopups();
+            browser.env.memoryPressureNotification(.moderate);
+        }
+        session.processQueuedDestroyed();
+
         const tick_result = self._tick(is_cdp, tick_opts) catch |err| {
             switch (err) {
                 error.JsError => {}, // already logged (with hopefully more context)
                 else => log.err(.browser, "session wait", .{
                     .err = err,
-                    .url = self.page.url,
+                    .url = self.frame.url,
                 }),
             }
             return err;
@@ -128,14 +146,18 @@ pub fn tickCDP(self: *Runner, opts: TickOpts) !CDPTickResult {
 }
 
 fn _tick(self: *Runner, comptime is_cdp: bool, opts: TickOpts) !CDPTickResult {
-    const page = self.page;
+    // Refresh self.frame from session. In case of pending page, we want to
+    // take its state while loading. If we use only the current frame, we will
+    // return a .done result immediately.
+    self.frame = self.session.pendingOrCurrentFrame() orelse return .done;
+    const frame = self.frame;
     const http_client = self.http_client;
 
-    switch (page._parse_state) {
+    switch (frame._parse_state) {
         .pre, .raw, .text, .image => {
-            // The main page hasn't started/finished navigating.
+            // The main frame hasn't started/finished navigating.
             // There's no JS to run, and no reason to run the scheduler.
-            if (http_client.active == 0 and (comptime is_cdp) == false) {
+            if (http_client.http_active == 0 and (comptime is_cdp) == false) {
                 // haven't started navigating, I guess.
                 return .done;
             }
@@ -151,10 +173,12 @@ fn _tick(self: *Runner, comptime is_cdp: bool, opts: TickOpts) !CDPTickResult {
         },
         .html, .complete => {
             const session = self.session;
-            if (session.queued_navigation.items.len != 0) {
-                try session.processQueuedNavigation();
-                self.page = &session.page.?; // might have changed
-                return .{ .ok = 0 };
+            if (session.currentPage()) |page| {
+                if (page.queued_navigation.items.len != 0) {
+                    try session.processQueuedNavigation();
+                    self.frame = session.currentFrame().?; // might have changed
+                    return .{ .ok = 0 };
+                }
             }
             const browser = session.browser;
 
@@ -162,47 +186,55 @@ fn _tick(self: *Runner, comptime is_cdp: bool, opts: TickOpts) !CDPTickResult {
             // download, or scheduled tasks to execute, or both.
 
             // scheduler.run could trigger new http transfers, so do not
-            // store http_client.active BEFORE this call and then use
+            // store http_client.http_active BEFORE this call and then use
             // it AFTER.
             try browser.runMacrotasks();
 
-            // Each call to this runs scheduled load events.
-            try page.dispatchLoad();
-
-            const http_active = http_client.active;
-            const total_network_activity = http_active + http_client.intercepted;
-            if (page._notified_network_almost_idle.check(total_network_activity <= 2)) {
-                page.notifyNetworkAlmostIdle();
+            const http_active = http_client.http_active;
+            const total_network_activity = http_active + http_client.interception_layer.intercepted;
+            if (frame._notified_network_almost_idle.check(total_network_activity <= 2)) {
+                frame.notifyNetworkAlmostIdle();
             }
-            if (page._notified_network_idle.check(total_network_activity == 0)) {
-                page.notifyNetworkIdle();
+            if (frame._notified_network_idle.check(total_network_activity == 0)) {
+                frame.notifyNetworkIdle();
             }
 
-            if (http_active == 0 and (comptime is_cdp == false)) {
+            switch (opts.until) {
+                .done => {},
+                .domcontentloaded => if (frame._load_state == .load or frame._load_state == .complete) {
+                    return .done;
+                },
+                .load => if (frame._load_state == .complete) {
+                    return .done;
+                },
+                .networkidle => if (frame._notified_network_idle == .done) {
+                    return .done;
+                },
+            }
+
+            if (http_active == 0 and http_client.ws_active == 0 and http_client.queue.first == null and http_client.ready_queue.first == null and (comptime is_cdp == false)) {
                 // we don't need to consider http_client.intercepted here
-                // because is_cdp is true, and that can only be
+                // because is_cdp is false, and that can only be
+                // the case when interception isn't possible.
+                //
+                // ready_queue is also part of the check: makeRequest now
+                // wraps its handles.perform() in a performing=true window,
+                // and any synchronous libcurl callback that ends up
+                // calling trackConn during that window (e.g. JS creating
+                // a WebSocket) will append to ready_queue. Without this
+                // check we could observe it non-empty after
+                // http_client.tick returns.
+                // we don't need to consider http_client.intercepted here
+                // because is_cdp is false, and that can only be
                 // the case when interception isn't possible.
                 if (comptime IS_DEBUG) {
-                    std.debug.assert(http_client.intercepted == 0);
+                    std.debug.assert(http_client.interception_layer.intercepted == 0);
                 }
 
                 if (browser.hasBackgroundTasks()) {
                     // _we_ have nothing to run, but v8 is working on
                     // background tasks. We'll wait for them.
                     browser.waitForBackgroundTasks();
-                }
-
-                switch (opts.until) {
-                    .done => {},
-                    .domcontentloaded => if (page._load_state == .load or page._load_state == .complete) {
-                        return .done;
-                    },
-                    .load => if (page._load_state == .complete) {
-                        return .done;
-                    },
-                    .networkidle => if (page._notified_network_idle == .done) {
-                        return .done;
-                    },
                 }
 
                 // We never advertise a wait time of more than 20, there can
@@ -232,7 +264,7 @@ fn _tick(self: *Runner, comptime is_cdp: bool, opts: TickOpts) !CDPTickResult {
             return .{ .ok = 0 };
         },
         .err => |err| {
-            page._parse_state = .{ .raw_done = @errorName(err) };
+            frame._parse_state = .{ .raw_done = @errorName(err) };
             return err;
         },
         .raw_done => {
@@ -256,9 +288,9 @@ pub fn waitForSelector(self: *Runner, selector: [:0]const u8, timeout_ms: u32) !
     const parsed_selector = try Selector.parseLeaky(arena, selector);
 
     while (true) {
-        // self.page can change between ticks
-        const page = self.page;
-        if (try parsed_selector.query(page.document.asNode(), page)) |el| {
+        // self.frame can change between ticks
+        const frame = self.frame;
+        if (try parsed_selector.query(frame.document.asNode(), frame)) |el| {
             return el;
         }
 
@@ -281,11 +313,11 @@ pub fn waitForScript(runner: *Runner, script: [:0]const u8, timeout_ms: u32) !vo
     var timer = try std.time.Timer.start();
 
     while (true) {
-        const page = runner.page;
+        const frame = runner.frame;
 
         // Execute the script and check if it returns truthy
         var ls: js.Local.Scope = undefined;
-        page.js.localScope(&ls);
+        frame.js.localScope(&ls);
         defer ls.deinit();
 
         var try_catch: js.TryCatch = undefined;
@@ -293,7 +325,7 @@ pub fn waitForScript(runner: *Runner, script: [:0]const u8, timeout_ms: u32) !vo
         defer try_catch.deinit();
 
         const value = ls.local.exec(script, "wait_script") catch |err| {
-            const caught = try_catch.caughtOrError(page.call_arena, err);
+            const caught = try_catch.caughtOrError(frame.call_arena, err);
             log.err(.app, "wait script error", .{ .err = caught });
             return error.ScriptError;
         };
@@ -323,35 +355,35 @@ test "Runner: no page" {
 }
 
 test "Runner: waitForSelector timeout" {
-    const page = try testing.pageTest("runner/runner1.html", .{});
-    defer page._session.removePage();
+    const frame = try testing.pageTest("runner/runner1.html", .{});
+    defer frame._session.removePage();
 
-    var runner = try page._session.runner(.{});
+    var runner = try frame._session.runner(.{});
     try testing.expectError(error.Timeout, runner.waitForSelector("#nope", 10));
 }
 
 test "Runner: waitForSelector" {
     defer testing.reset();
-    const page = try testing.pageTest("runner/runner1.html", .{});
-    defer page._session.removePage();
+    const frame = try testing.pageTest("runner/runner1.html", .{});
+    defer frame._session.removePage();
 
-    var runner = try page._session.runner(.{});
+    var runner = try frame._session.runner(.{});
     const el = try runner.waitForSelector("#sel1", 10);
     try testing.expectEqual("selector-1-content", try el.asNode().getTextContentAlloc(testing.arena_allocator));
 }
 
 test "Runner: waitForScript timeout" {
-    const page = try testing.pageTest("runner/runner1.html", .{});
-    defer page._session.removePage();
+    const frame = try testing.pageTest("runner/runner1.html", .{});
+    defer frame._session.removePage();
 
-    var runner = try page._session.runner(.{});
+    var runner = try frame._session.runner(.{});
     try testing.expectError(error.Timeout, runner.waitForScript("document.querySelector('#nope')", 10));
 }
 
 test "Runner: waitForScript" {
-    const page = try testing.pageTest("runner/runner1.html", .{});
-    defer page._session.removePage();
+    const frame = try testing.pageTest("runner/runner1.html", .{});
+    defer frame._session.removePage();
 
-    var runner = try page._session.runner(.{});
+    var runner = try frame._session.runner(.{});
     try runner.waitForScript("document.querySelector('#sel1')", 10);
 }

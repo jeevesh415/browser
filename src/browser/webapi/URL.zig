@@ -20,7 +20,6 @@ const std = @import("std");
 const js = @import("../js/js.zig");
 
 const U = @import("../URL.zig");
-const Page = @import("../Page.zig");
 const URLSearchParams = @import("net/URLSearchParams.zig");
 const Blob = @import("Blob.zig");
 const Execution = js.Execution;
@@ -248,28 +247,36 @@ pub fn canParse(url: []const u8, base_: ?[]const u8) bool {
     return U.isCompleteHTTPUrl(url);
 }
 
-pub fn createObjectURL(blob: *Blob, page: *Page) ![]const u8 {
+pub fn createObjectURL(blob: *Blob, exec: *const Execution) ![]const u8 {
     var uuid_buf: [36]u8 = undefined;
     @import("../../id.zig").uuidv4(&uuid_buf);
 
-    const blob_url = try std.fmt.allocPrint(
-        page.arena,
-        "blob:{s}/{s}",
-        .{ page.origin orelse "null", uuid_buf },
-    );
-    try page._blob_urls.put(page.arena, blob_url, blob);
-    blob.acquireRef();
-    return blob_url;
+    switch (exec.context.global) {
+        inline else => |g| {
+            const blob_url = try std.fmt.allocPrint(
+                g.arena,
+                "blob:{s}/{s}",
+                .{ g.origin orelse "null", uuid_buf },
+            );
+            try g._blob_urls.put(g.arena, blob_url, blob);
+            blob.acquireRef();
+            return blob_url;
+        },
+    }
 }
 
-pub fn revokeObjectURL(url: []const u8, page: *Page) void {
+pub fn revokeObjectURL(url: []const u8, exec: *const Execution) void {
     // Per spec: silently ignore non-blob URLs
     if (!std.mem.startsWith(u8, url, "blob:")) {
         return;
     }
 
-    if (page._blob_urls.fetchRemove(url)) |entry| {
-        entry.value.releaseRef(page._session);
+    switch (exec.context.global) {
+        inline else => |g| {
+            if (g._blob_urls.fetchRemove(url)) |entry| {
+                entry.value.releaseRef(g._page);
+            }
+        },
     }
 }
 

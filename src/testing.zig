@@ -17,6 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
+const log = lp.log;
 const Allocator = std.mem.Allocator;
 
 pub const allocator = std.testing.allocator;
@@ -40,7 +43,7 @@ const App = @import("App.zig");
 const js = @import("browser/js/js.zig");
 const Config = @import("Config.zig");
 const HttpClient = @import("browser/HttpClient.zig");
-const Page = @import("browser/Page.zig");
+const Frame = @import("browser/Frame.zig");
 const Browser = @import("browser/Browser.zig");
 const Session = @import("browser/Session.zig");
 const Notification = @import("Notification.zig");
@@ -177,11 +180,6 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     } else {
         std.debug.print(fmt, args);
     }
-}
-
-const String = @import("string.zig").String;
-pub fn newString(str: []const u8) String {
-    return String.init(arena_allocator, str, .{}) catch unreachable;
 }
 
 pub const Random = struct {
@@ -335,17 +333,25 @@ fn isJsonValue(a: std.json.Value, b: std.json.Value) bool {
 }
 
 pub var test_app: *App = undefined;
-pub var test_http: *HttpClient = undefined;
 pub var test_browser: Browser = undefined;
 pub var test_notification: *Notification = undefined;
 pub var test_session: *Session = undefined;
 
 const WEB_API_TEST_ROOT = "src/browser/tests/";
-const HtmlRunnerOpts = struct {};
+const HtmlRunnerOpts = struct {
+    timeout_ms: u32 = 2000,
+    inject_script: ?[]const u8 = null,
+};
 
 pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
-    _ = opts;
     defer reset();
+
+    var inject_scripts: [1][]const u8 = undefined;
+    if (opts.inject_script) |script| {
+        inject_scripts[0] = script;
+        test_session.inject_scripts = inject_scripts[0..1];
+    }
+    defer test_session.inject_scripts = &.{};
 
     const root = try std.fs.path.joinZ(arena_allocator, &.{ WEB_API_TEST_ROOT, path });
     const stat = std.fs.cwd().statFile(root) catch |err| {
@@ -359,7 +365,7 @@ pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
                 return;
             }
             try @import("root").subtest(root);
-            try runWebApiTest(root);
+            try runWebApiTest(root, opts.timeout_ms);
         },
         .directory => {
             var dir = try std.fs.cwd().openDir(root, .{
@@ -385,7 +391,7 @@ pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
 
                 const full_path = try std.fs.path.joinZ(arena_allocator, &.{ root, entry.name });
                 try @import("root").subtest(entry.name);
-                try runWebApiTest(full_path);
+                try runWebApiTest(full_path, opts.timeout_ms);
             }
         },
         else => |kind| {
@@ -395,8 +401,8 @@ pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
     }
 }
 
-fn runWebApiTest(test_file: [:0]const u8) !void {
-    const page = try test_session.createPage();
+fn runWebApiTest(test_file: [:0]const u8, timeout_ms: u32) !void {
+    const frame = try test_session.createPage();
     defer test_session.removePage();
 
     const url = try std.fmt.allocPrintSentinel(
@@ -407,7 +413,7 @@ fn runWebApiTest(test_file: [:0]const u8) !void {
     );
 
     var ls: js.Local.Scope = undefined;
-    page.js.localScope(&ls);
+    frame.js.localScope(&ls);
     defer ls.deinit();
 
     {
@@ -415,13 +421,13 @@ fn runWebApiTest(test_file: [:0]const u8) !void {
         try_catch.init(&ls.local);
         defer try_catch.deinit();
 
-        try page.navigate(url, .{});
+        try frame.navigate(url, .{});
     }
 
     var runner = try test_session.runner(.{});
-    try runner.wait(.{ .ms = 2000 });
+    try runner.wait(.{ .ms = 2000, .until = .load });
 
-    var wait_ms: u32 = 2000;
+    var wait_ms: u32 = timeout_ms;
     var timer = try std.time.Timer.start();
     while (true) {
         var try_catch: js.TryCatch = undefined;
@@ -443,6 +449,7 @@ fn runWebApiTest(test_file: [:0]const u8) !void {
 
         const ms_elapsed = timer.lap() / 1_000_000;
         if (ms_elapsed >= wait_ms) {
+            ls.local.eval("testing.printTimeoutState()", "testing.printTimeoutState()") catch {};
             return error.TestTimedOut;
         }
         wait_ms -= @intCast(ms_elapsed);
@@ -453,8 +460,8 @@ fn runWebApiTest(test_file: [:0]const u8) !void {
 const PageTestOpts = struct {
     wait_until_done: bool = true,
 };
-pub fn pageTest(comptime test_file: []const u8, opts: PageTestOpts) !*Page {
-    const page = try test_session.createPage();
+pub fn pageTest(comptime test_file: []const u8, opts: PageTestOpts) !*Frame {
+    const frame = try test_session.createPage();
     errdefer test_session.removePage();
 
     const url = try std.fmt.allocPrintSentinel(
@@ -464,15 +471,14 @@ pub fn pageTest(comptime test_file: []const u8, opts: PageTestOpts) !*Page {
         0,
     );
 
-    try page.navigate(url, .{});
+    try frame.navigate(url, .{});
     var runner = try test_session.runner(.{});
     if (opts.wait_until_done) {
         try runner.wait(.{ .ms = 2000 });
     }
-    return page;
+    return frame;
 }
 
-const log = @import("log.zig");
 const TestHTTPServer = @import("TestHTTPServer.zig");
 const TestWSServer = @import("TestWSServer.zig");
 
@@ -493,20 +499,15 @@ test "tests:beforeAll" {
     const test_allocator = @import("root").tracking_allocator;
 
     test_config = try Config.init(test_allocator, "test", .{ .serve = .{
-        .common = .{
-            .tls_verify_host = false,
-            .user_agent_suffix = "internal-tester",
-            .ws_max_concurrent = 50,
-        },
+        .insecure_disable_tls_host_verification = true,
+        .user_agent_suffix = "internal-tester",
+        .ws_max_concurrent = 50,
     } });
 
     test_app = try App.init(test_allocator, &test_config);
     errdefer test_app.deinit();
 
-    test_http = try HttpClient.init(test_allocator, &test_app.network);
-    errdefer test_http.deinit();
-
-    test_browser = try Browser.init(test_app, .{ .http_client = test_http });
+    try test_browser.init(test_app, .{}, null);
     errdefer test_browser.deinit();
 
     // Create notification for testing
@@ -561,7 +562,6 @@ test "tests:afterAll" {
 
     test_notification.deinit();
     test_browser.deinit();
-    test_http.deinit();
     test_app.deinit();
     test_config.deinit(@import("root").tracking_allocator);
 }
@@ -614,11 +614,49 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/redirect-no-fragment")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "/redirect-target" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect-target")) {
+        return req.respond("<!DOCTYPE html><title>landed</title>", .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect-with-fragment")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "/redirect-target#target_fragment" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/xhr/404")) {
         return req.respond("Not Found", .{
             .status = .not_found,
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "text/plain" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/404.js")) {
+        // Valid JS body served with a 404 status. Used to assert that
+        // ScriptManager does NOT execute the body of a failed script
+        // fetch — if it did, window.__404_body_executed would be set.
+        return req.respond("window.__404_body_executed = true;", .{
+            .status = .not_found,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/javascript" },
             },
         });
     }
@@ -636,6 +674,63 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         return req.respond(&.{ 0, 0, 1, 2, 0, 0, 9 }, .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "application/octet-stream" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/echo_referer")) {
+        // Echo the request's Referer header back as HTML so tests can assert
+        // what Referer the navigation sent. Used by the cross-page Referer test.
+        var it = req.iterateHeaders();
+        var referer: []const u8 = "NONE";
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "Referer")) {
+                referer = h.value;
+                break;
+            }
+        }
+        var html_buf: [512]u8 = undefined;
+        const html = try std.fmt.bufPrint(&html_buf, "<html><body>referer={s}</body></html>", .{referer});
+        return req.respond(html, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/referer_link.html")) {
+        // Page with an anchor link to /echo_referer. The test clicks the link
+        // via JS and asserts the resulting page reports Referer = this page.
+        return req.respond(
+            "<html><body><a id=\"link\" href=\"/echo_referer\">go</a></body></html>",
+            .{
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+                },
+            },
+        );
+    }
+
+    if (std.mem.eql(u8, path, "/echo_method")) {
+        // Echo the request method back as HTML so tests can assert on what
+        // method the navigation used. Used by the Page.reload-replays-POST test.
+        const method_name = @tagName(req.head.method);
+        var html_buf: [128]u8 = undefined;
+        const html = try std.fmt.bufPrint(&html_buf, "<html><body>method={s}</body></html>", .{method_name});
+        return req.respond(html, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect_to_echo")) {
+        // 302 to /echo_method. Used by the Page.reload-after-redirect test to
+        // confirm a POST→302→GET chain doesn't replay POST on reload.
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "/echo_method" },
             },
         });
     }

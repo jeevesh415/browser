@@ -17,11 +17,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const String = @import("../../../string.zig").String;
+const lp = @import("lightpanda");
 
 const Page = @import("../../Page.zig");
-const Session = @import("../../Session.zig");
 const Event = @import("../Event.zig");
+
+const String = lp.String;
 const Allocator = std.mem.Allocator;
 
 const ProgressEvent = @This();
@@ -54,7 +55,7 @@ pub fn initTrusted(typ: String, _opts: ?Options, page: *Page) !*ProgressEvent {
 fn initWithTrusted(arena: Allocator, typ: String, _opts: ?Options, trusted: bool, page: *Page) !*ProgressEvent {
     const opts = _opts orelse Options{};
 
-    const event = try page._factory.event(
+    const event = try page.factory.event(
         arena,
         typ,
         ProgressEvent{
